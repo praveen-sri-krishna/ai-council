@@ -1,0 +1,355 @@
+"""AI Council GUI -- "Situation Room".
+
+A live deliberation viewer: watch proposals, critiques, evidence verdicts and the
+consensus climb in real time; read the final ranked plan, evidence ledger and
+leaderboard; then talk 1:1 with the Leader (the best-performing model).
+
+Design: industrial-utilitarian x editorial. Ink canvas, single signal-amber
+accent, monospace operational trace, editorial display type. Anchor: the live
+consensus meter + seat cards that light up as each model speaks.
+"""
+import datetime
+import html
+import queue
+import threading
+from pathlib import Path
+
+import gradio as gr
+
+import orchestrator
+from leader import leader_chat, leader_id, load_session
+from seats import available_seats, load_config
+
+SESSIONS = Path("sessions")
+SESSIONS.mkdir(exist_ok=True)
+
+VERDICT_COLOR = {"supported": "var(--green)", "refuted": "var(--red)", "uncertain": "var(--amber)"}
+
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=JetBrains+Mono:wght@400;600&display=swap');
+:root{--ink:#0c0f13;--panel:#141a21;--panel2:#1b232d;--amber:#ffb000;--amber2:#ff8a00;
+--text:#e7ebf0;--muted:#8a94a3;--green:#3ecf8e;--red:#ff5d5d;--line:#283441;}
+.gradio-container{background:var(--ink)!important;color:var(--text)!important;
+font-family:'JetBrains Mono',monospace!important;max-width:1280px!important;}
+#sr-head{border-bottom:1px solid var(--line);padding:14px 6px 18px;margin-bottom:8px;}
+#sr-head h1{font-family:'Fraunces',serif;font-weight:700;font-size:30px;letter-spacing:-.5px;
+margin:0;color:var(--text);}
+#sr-head h1 .ac{color:var(--amber);}
+#sr-head p{color:var(--muted);margin:4px 0 0;font-size:12.5px;letter-spacing:.3px;}
+.sr-card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;}
+.sr-label{font-size:11px;text-transform:uppercase;letter-spacing:2px;color:var(--muted);margin:0 0 8px;}
+/* consensus meter */
+.meter-wrap{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;}
+.meter-num{font-family:'Fraunces',serif;font-size:42px;font-weight:700;line-height:1;color:var(--amber);}
+.meter-sub{color:var(--muted);font-size:12px;margin-top:2px;}
+.meter-track{position:relative;height:14px;background:var(--panel2);border-radius:8px;margin:14px 0 6px;overflow:hidden;}
+.meter-fill{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--amber2),var(--amber));
+border-radius:8px;transition:width .5s cubic-bezier(.2,.8,.2,1);}
+.meter-thresh{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--text);opacity:.65;}
+.meter-rounds{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;}
+.r-dot{font-size:11px;color:var(--muted);background:var(--panel2);border:1px solid var(--line);
+border-radius:20px;padding:2px 9px;}
+.r-dot b{color:var(--amber);}
+/* trace feed */
+#trace{height:440px;overflow-y:auto;display:flex;flex-direction:column;gap:7px;padding-right:6px;}
+.ev{border-left:2px solid var(--line);padding:7px 11px;background:var(--panel);border-radius:0 8px 8px 0;
+animation:rise .35s ease;}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.ev .who{font-size:10.5px;text-transform:uppercase;letter-spacing:1.4px;color:var(--muted);}
+.ev .txt{font-size:13px;margin-top:3px;color:var(--text);}
+.ev.phase{border-left-color:var(--amber);background:transparent;padding:10px 11px 2px;}
+.ev.phase .who{color:var(--amber);font-family:'Fraunces',serif;font-size:14px;letter-spacing:1px;text-transform:none;}
+.ev.propose{border-left-color:#6aa3ff;}
+.ev.lateral{border-left-color:var(--amber);background:rgba(255,176,0,.06);}
+.ev.round{border-left-color:var(--green);}
+.chip{display:inline-block;font-size:10px;padding:1px 7px;border-radius:20px;border:1px solid var(--line);
+color:var(--muted);margin-left:6px;}
+.vchip{display:inline-block;font-size:10px;font-weight:600;padding:1px 8px;border-radius:4px;color:#0c0f13;}
+/* results */
+.res h3{font-family:'Fraunces',serif;color:var(--amber);font-size:16px;margin:2px 0 10px;}
+.res ol{padding-left:18px;margin:0;} .res li{margin:0 0 9px;font-size:13.5px;line-height:1.5;}
+.res .fix{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:9px 11px;margin:0 0 8px;}
+.res .fix .o{color:var(--red);font-size:12px;} .res .fix .s{color:var(--green);font-size:12.5px;margin-top:3px;}
+.lb-row{display:flex;align-items:center;gap:10px;margin:6px 0;}
+.lb-bar{height:10px;background:linear-gradient(90deg,var(--amber2),var(--amber));border-radius:6px;}
+.lb-name{width:150px;font-size:12.5px;} .lb-name .crown{color:var(--amber);}
+.tag{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:20px;
+padding:2px 10px;font-size:11.5px;margin:3px 4px 0 0;color:var(--text);}
+"""
+
+
+# ---------- renderers ----------
+
+def _esc(s) -> str:
+    return html.escape(str(s))
+
+
+def render_meter(best: float | None, threshold: float, rounds: list[dict]) -> str:
+    pct = int((best or 0) * 100)
+    tpct = int(threshold * 100)
+    converged = best is not None and best >= threshold
+    state = "CONSENSUS REACHED" if converged else ("DELIBERATING" if rounds else "IDLE")
+    dots = "".join(
+        f"<span class='r-dot'>R{r['n']} <b>{r['best']:.2f}</b></span>" for r in rounds)
+    return f"""
+    <div class='meter-wrap'>
+      <div style='display:flex;justify-content:space-between;align-items:flex-end'>
+        <div><div class='meter-num'>{(best or 0):.3f}</div>
+          <div class='meter-sub'>{state} &middot; threshold {threshold:.2f}</div></div>
+        <div style='text-align:right' class='meter-sub'>consensus<br>confidence</div>
+      </div>
+      <div class='meter-track'>
+        <div class='meter-fill' style='width:{pct}%'></div>
+        <div class='meter-thresh' style='left:{tpct}%'></div>
+      </div>
+      <div class='meter-rounds'>{dots or "<span class='meter-sub'>awaiting first round…</span>"}</div>
+    </div>"""
+
+
+def render_trace(events: list[dict]) -> str:
+    rows = []
+    for e in events:
+        t = e.get("type")
+        if t == "start":
+            rows.append(f"<div class='ev phase'><div class='who'>SESSION OPEN</div>"
+                        f"<div class='txt'>{_esc(e['idea'])}<br>"
+                        f"<span class='chip'>{len(e['seats'])} seats</span>"
+                        f"<span class='chip'>chair: {_esc(e['chair'])}</span>"
+                        f"<span class='chip'>grounded: {e['grounded']}</span></div></div>")
+        elif t == "phase":
+            rows.append(f"<div class='ev phase'><div class='who'>{_esc(e['name'])}</div></div>")
+        elif t == "memory":
+            rows.append(f"<div class='ev'><div class='who'>memory</div>"
+                        f"<div class='txt'>{_esc(e['msg'])}</div></div>")
+        elif t == "research":
+            rows.append(f"<div class='ev'><div class='who'>prior art</div>"
+                        f"<div class='txt'>{e['count']} existing tools &middot; top: "
+                        f"<b>{_esc(e['top'])}</b></div></div>")
+        elif t == "propose":
+            bo = "".join(f"<span class='chip'>{_esc(x)}</span>" for x in (e.get("builds_on") or [])[:3])
+            rows.append(f"<div class='ev propose'><div class='who'>{_esc(e['seat'])} "
+                        f"&middot; {_esc(e['role'])}</div>"
+                        f"<div class='txt'>{_esc(e['proposal'][:280])}{bo}</div></div>")
+        elif t == "critique":
+            rows.append(f"<div class='ev'><div class='who'>{_esc(e['seat'])}</div>"
+                        f"<div class='txt'>critiqued {e['n']} peers</div></div>")
+        elif t == "webground":
+            col = VERDICT_COLOR.get(e["verdict"], "var(--muted)")
+            rows.append(f"<div class='ev'><div class='who'>fact-check</div>"
+                        f"<div class='txt'><span class='vchip' style='background:{col}'>"
+                        f"{_esc(e['verdict'])}</span> {_esc(e['claim'][:140])}</div></div>")
+        elif t == "webground_summary":
+            c = e.get("counts") or {}
+            rows.append(f"<div class='ev'><div class='who'>evidence</div>"
+                        f"<div class='txt'>supported {c.get('supported',0)} &middot; "
+                        f"refuted {c.get('refuted',0)} &middot; uncertain {c.get('uncertain',0)} "
+                        f"&middot; <b>ratio {e.get('ratio')}</b></div></div>")
+        elif t == "revise":
+            rows.append(f"<div class='ev'><div class='who'>revise</div>"
+                        f"<div class='txt'>{e['n']} seats revised their plans</div></div>")
+        elif t == "lateral":
+            rows.append(f"<div class='ev lateral'><div class='who'>out-of-the-box</div>"
+                        f"<div class='txt'>{_esc(e['proposal'][:240])}</div></div>")
+        elif t == "round":
+            arrow = "reached threshold" if e["best"] >= e["threshold"] else f"best {e['best']:.3f}"
+            rows.append(f"<div class='ev round'><div class='who'>round {e['n']}</div>"
+                        f"<div class='txt'>this round {e['this']:.3f} &middot; {arrow}</div></div>")
+        elif t == "error":
+            rows.append(f"<div class='ev' style='border-left-color:var(--red)'>"
+                        f"<div class='who' style='color:var(--red)'>error</div>"
+                        f"<div class='txt'>{_esc(e['msg'])}</div></div>")
+    # Newest first: gr.HTML can't run a scroll script, so the latest event stays
+    # visible at the top of the fixed-height feed.
+    feed = "".join(reversed(rows)) or "<div class='meter-sub'>Run a deliberation to watch it unfold.</div>"
+    return f"<div id='trace'>{feed}</div>"
+
+
+def render_results(final: dict) -> tuple[str, str, str]:
+    if not final:
+        empty = "<div class='res'><p class='meter-sub'>No result yet.</p></div>"
+        return empty, empty, empty
+    plan = "".join(f"<li>{_esc(p)}</li>" for p in final.get("ranked_plan", []))
+    fixes = "".join(f"<div class='fix'><div class='o'>&#9888; {_esc(f.get('objection',''))}</div>"
+                    f"<div class='s'>&#10003; {_esc(f.get('solution',''))}</div></div>"
+                    for f in final.get("fixes", []))
+    tools = "".join(f"<span class='tag'>{_esc(t)}</span>" for t in final.get("builds_on", []))
+    plan_html = (f"<div class='res'><h3>Ranked plan &middot; confidence {final.get('confidence')}</h3>"
+                 f"<ol>{plan}</ol>"
+                 + (f"<h3 style='margin-top:14px'>Solutions to objections</h3>{fixes}" if fixes else "")
+                 + (f"<h3 style='margin-top:14px'>Builds on</h3>{tools}" if tools else "") + "</div>")
+
+    verds = "".join(
+        f"<div class='ev'><div class='txt'><span class='vchip' style='background:"
+        f"{VERDICT_COLOR.get(v.get('verdict'),'var(--muted)')}'>{_esc(v.get('verdict'))}</span> "
+        f"{_esc(v.get('claim',''))}<br><span class='meter-sub'>{_esc(v.get('note',''))}</span></div></div>"
+        for v in final.get("verdicts", []))
+    c = final.get("evidence_counts") or {}
+    ev_html = (f"<div class='res'><h3>Evidence ledger &middot; ratio {final.get('evidence_ratio')}</h3>"
+               f"<p class='meter-sub'>supported {c.get('supported',0)} &middot; refuted "
+               f"{c.get('refuted',0)} &middot; uncertain {c.get('uncertain',0)}</p>{verds}</div>")
+
+    lb = final.get("leaderboard") or {}
+    best = final.get("best_model")
+    rows = ""
+    for sid, score in lb.items():
+        crown = " &#9818;" if sid == best else ""
+        rows += (f"<div class='lb-row'><div class='lb-name'>{'<span class=crown>' if sid==best else ''}"
+                 f"{_esc(sid)}{crown}{'</span>' if sid==best else ''}</div>"
+                 f"<div class='lb-bar' style='width:{int(score*220)}px'></div>"
+                 f"<div class='meter-sub'>{score}</div></div>")
+    mr = final.get("minority_report") or {}
+    lb_html = (f"<div class='res'><h3>Leaderboard &middot; leader: {_esc(best)}</h3>{rows}"
+               f"<h3 style='margin-top:16px'>Minority report ({_esc(mr.get('seat',''))})</h3>"
+               f"<div class='ev' style='border-left-color:var(--red)'><div class='txt'>"
+               f"{_esc(mr.get('reason',''))}</div></div>"
+               + ("".join(f"<div class='ev'><div class='txt'>&middot; {_esc(d)}</div></div>"
+                          for d in final.get('dissent', []))) + "</div>")
+    return plan_html, ev_html, lb_html
+
+
+# ---------- run handler (streaming) ----------
+
+def run_debate_stream(idea: str, privacy: str, selected: list[str]):
+    cfg = load_config()
+    cfg.privacy_mode = privacy
+    avail = {s.id: s for s in available_seats(cfg)}
+    seats = [avail[i] for i in selected if i in avail]
+    blank = render_results({})
+    if len(seats) < 2:
+        yield (render_trace([{"type": "error", "msg": "Pick at least 2 available seats "
+                              "(hosted seats need their API key; local need Ollama)."}]),
+               render_meter(None, cfg.consensus_threshold, []), *blank)
+        return
+
+    if not idea.strip():
+        yield (render_trace([{"type": "error", "msg": "Enter an idea or problem to deliberate."}]),
+               render_meter(None, cfg.consensus_threshold, []), *blank)
+        return
+
+    q: queue.Queue = queue.Queue()
+    orchestrator.set_emit(lambda e: q.put(e))
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = str(SESSIONS / f"session_{stamp}.json")
+
+    def worker():
+        try:
+            orchestrator.run_debate(idea, seats, cfg, session_path=path)
+        except Exception as ex:  # never hang the UI
+            q.put({"type": "error", "msg": f"{type(ex).__name__}: {ex}"})
+        finally:
+            q.put({"type": "_done"})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    events: list[dict] = []
+    rounds: list[dict] = []
+    best = None
+    final: dict = {}
+    while True:
+        e = q.get()
+        if e.get("type") == "_done":
+            break
+        if e["type"] == "round":
+            rounds.append(e)
+            best = e["best"]
+        if e["type"] == "final":
+            final = e["final"]
+        events.append(e)
+        yield (render_trace(events), render_meter(best, cfg.consensus_threshold, rounds),
+               *render_results(final))
+    yield (render_trace(events), render_meter(best, cfg.consensus_threshold, rounds),
+           *render_results(final))
+
+
+# ---------- leader chat ----------
+
+def list_sessions() -> list[str]:
+    return sorted([str(p) for p in SESSIONS.glob("*.json")
+                   if not p.name.startswith(".")], reverse=True)
+
+
+def on_pick_session(path: str) -> str:
+    if not path or not Path(path).exists():
+        return "_No session selected._"
+    s = load_session(path)
+    lid = leader_id(s) or "(none)"
+    return f"**Leader:** `{lid}` &nbsp;·&nbsp; debate: _{s.get('prompt','')[:90]}_"
+
+
+def on_leader_msg(path: str, msg: str, history: list):
+    history = history or []
+    if not path or not Path(path).exists():
+        history.append({"role": "assistant", "content": "Pick a saved session first."})
+        return history, ""
+    s = load_session(path)
+    pairs = [(history[i]["content"], history[i + 1]["content"])
+             for i in range(0, len(history) - 1, 2)]
+    res = leader_chat(s, msg, pairs)
+    tag = ""
+    if res.get("decision") == "consult_group":
+        names = ", ".join(g["seat"] for g in res.get("group", []))
+        tag = f"\n\n_— consulted the group ({names})_"
+    history.append({"role": "user", "content": msg})
+    history.append({"role": "assistant", "content": res.get("answer", "") + tag})
+    return history, ""
+
+
+# ---------- layout ----------
+
+def build() -> gr.Blocks:
+    cfg = load_config()
+    seat_ids = [s.id for s in cfg.seats]
+    default_sel = [i for i in ("cerebras-fast", "groq-fast", "gemini-chair") if i in seat_ids]
+
+    with gr.Blocks(title="AI Council — Situation Room") as app:
+        gr.HTML("<div id='sr-head'><h1>AI <span class='ac'>Council</span> "
+                "&mdash; Situation Room</h1><p>A panel of models proposes, critiques, "
+                "web-checks, and converges. Watch it think. Then brief the Leader.</p></div>")
+
+        with gr.Tab("Deliberate"):
+            with gr.Row():
+                with gr.Column(scale=4):
+                    gr.HTML("<p class='sr-label'>The problem</p>")
+                    idea = gr.Textbox(placeholder="An idea or problem to put to the council…",
+                                      lines=4, show_label=False)
+                    privacy = gr.Radio(["open", "local_only"], value=cfg.privacy_mode,
+                                       label="Privacy mode")
+                    seats = gr.CheckboxGroup(seat_ids, value=default_sel, label="Seats")
+                    run = gr.Button("Convene the council", variant="primary")
+                    meter = gr.HTML(render_meter(None, cfg.consensus_threshold, []))
+                with gr.Column(scale=6):
+                    gr.HTML("<p class='sr-label'>Live deliberation</p>")
+                    trace = gr.HTML(render_trace([]))
+            with gr.Row():
+                with gr.Column():
+                    plan = gr.HTML(render_results({})[0])
+                with gr.Column():
+                    evidence = gr.HTML(render_results({})[1])
+                with gr.Column():
+                    leaderboard = gr.HTML(render_results({})[2])
+            run.click(run_debate_stream, [idea, privacy, seats],
+                      [trace, meter, plan, evidence, leaderboard])
+
+        with gr.Tab("Leader chat"):
+            gr.HTML("<p class='sr-label'>Brief the leader 1:1 — they answer, "
+                    "or take it back to the group</p>")
+            with gr.Row():
+                sess = gr.Dropdown(list_sessions(), label="Session", scale=4)
+                refresh = gr.Button("↻", scale=1)
+            who = gr.Markdown("_No session selected._")
+            chat = gr.Chatbot(height=380)
+            with gr.Row():
+                msg = gr.Textbox(placeholder="Ask the leader about the plan, a dropped idea, "
+                                 "a trade-off…", show_label=False, scale=5)
+                send = gr.Button("Send", variant="primary", scale=1)
+            refresh.click(lambda: gr.update(choices=list_sessions()), None, sess)
+            sess.change(on_pick_session, sess, who)
+            send.click(on_leader_msg, [sess, msg, chat], [chat, msg])
+            msg.submit(on_leader_msg, [sess, msg, chat], [chat, msg])
+
+    return app
+
+
+if __name__ == "__main__":
+    build().launch(server_name="127.0.0.1", server_port=7860, inbrowser=True,
+                   css=CSS, theme=gr.themes.Base())

@@ -1,0 +1,15 @@
+[project]
+name = "ai-council"
+version = "0.1.0"
+description = "Local-first multi-model think tank: propose, critique, web-ground, synthesize."
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.40",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "ddgs>=9.14.4",
+    "gradio>=6.19.0",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,97 @@
+# AI Council — configuration. Edit seats/thresholds here; no code changes needed.
+
+privacy_mode: open          # local_only = local seats + no search egress | open = hosted seats allowed
+search_provider: duckduckgo # duckduckgo (keyless) | searxng (Docker, swap in later)
+consensus_threshold: 0.95   # synthesis vote average needed to finish
+max_iterations: 4           # hard cap on synthesize->vote loops
+history_compress_after: 15  # compress Memory Palace discussion log past this many entries
+
+defaults:
+  timeout: 600              # local reasoning models cold-load then think; hosted still returns in seconds
+  max_tokens: 8000          # generous output budget so thinking models can think AND finish the JSON (free models, no cost)
+  temperature: 0.7
+  num_ctx: 16384            # local: KV cache room for thinking + answer while staying on the 16GB GPU
+  max_retries: 3            # routing hardening: retry transient failures (429/5xx/timeout)
+  retry_base: 2.0           # exponential backoff base seconds (honors Retry-After when sent)
+  retry_cap: 30.0
+  # Groq + Cerebras sit behind Cloudflare and 403 (error 1010) on Python's default UA.
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+
+# --- Seats: one participant each. All called through the same call_seat(). ---
+# local: true  -> no key, keep_alive controls VRAM residency (0 = unload after speaking)
+# key_env      -> seat is skipped gracefully if that env var is missing
+seats:
+  # ---- Local (privacy lane, RTX 4080 16GB; one model resident at a time) ----
+  - id: qwen-generalist
+    provider: ollama
+    base_url: http://localhost:11434/v1
+    model: qwen3:14b
+    role: generalist
+    personality: "Pragmatic daily-driver. Clear, balanced, ships."
+    local: true
+    keep_alive: 0
+
+  - id: deepseek-critic
+    provider: ollama
+    base_url: http://localhost:11434/v1
+    model: deepseek-r1:14b
+    role: red-teamer
+    personality: "Adversarial reasoner. Hunts failure modes and hidden assumptions."
+    local: true
+    keep_alive: 0
+
+  - id: gemma-dissenter
+    provider: ollama
+    base_url: http://localhost:11434/v1
+    model: gemma3:12b
+    role: dissenter
+    personality: "Google-lineage priors. Argues the unpopular but defensible angle."
+    local: true
+    keep_alive: 0
+
+  # ---- Hosted (open mode). Priority order favours fastest+free first. ----
+  - id: cerebras-fast
+    provider: cerebras
+    base_url: https://api.cerebras.ai/v1
+    model: gpt-oss-120b
+    key_env: CEREBRAS_API_KEY
+    role: fast-heavyweight
+    personality: "Fast, high-capacity reasoning. Keeps debate rounds snappy."
+
+  - id: nvidia-heavy
+    provider: nvidia
+    base_url: https://integrate.api.nvidia.com/v1
+    model: qwen/qwen3.5-122b-a10b
+    key_env: NVIDIA_API_KEY
+    role: heavyweight
+    personality: "Large-model depth my GPU can't run locally."
+
+  - id: gemini-chair
+    provider: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    model: gemini-2.5-flash
+    key_env: GEMINI_API_KEY
+    role: chair
+    personality: "Synthesizer + researcher. 1M context for ingesting evidence."
+    # No reasoning_effort cap: let it think fully. We give a large max_tokens instead
+    # so thinking + the full JSON answer both fit (thinking counts toward output budget).
+
+  - id: groq-fast
+    provider: groq
+    base_url: https://api.groq.com/openai/v1
+    model: llama-3.3-70b-versatile
+    key_env: GROQ_API_KEY
+    role: fast-backup
+    personality: "Snappy fallback fast lane."
+
+  - id: kimi-builder
+    provider: openrouter
+    base_url: https://openrouter.ai/api/v1
+    model: moonshotai/kimi-k2.7-code
+    key_env: OPENROUTER_API_KEY
+    role: builder
+    personality: "Turns the agreed plan into concrete build steps. Used sparingly."
+
+# Failover order by lane (used in Phase 5 hardening): try these provider ids in turn on 429/error.
+failover:
+  fast: [cerebras-fast, groq-fast, nvidia-heavy]
