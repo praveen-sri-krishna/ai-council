@@ -81,6 +81,8 @@ def write_case(mp: "MemoryPalace", limit_plan: int = 6) -> bool:
     plan = final.get("ranked_plan", [])[:limit_plan]
     body = {
         "idea": mp.prompt,
+        "mode": final.get("mode"),
+        "direct_answer": final.get("direct_answer", ""),
         "ranked_plan": plan,
         "builds_on": final.get("builds_on", []),
         "confidence": final.get("confidence"),

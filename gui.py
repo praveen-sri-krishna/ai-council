@@ -67,6 +67,8 @@ color:var(--muted);margin-left:6px;}
 .vchip{display:inline-block;font-size:10px;font-weight:600;padding:1px 8px;border-radius:4px;color:#0c0f13;}
 /* results */
 .res h3{font-family:'Fraunces',serif;color:var(--amber);font-size:16px;margin:2px 0 10px;}
+.answer{background:rgba(255,176,0,.08);border:1px solid var(--amber);border-radius:10px;padding:13px 15px;margin-bottom:14px;}
+.answer .atxt{font-size:15px;line-height:1.55;margin-top:6px;color:var(--text);}
 .res ol{padding-left:18px;margin:0;} .res li{margin:0 0 9px;font-size:13.5px;line-height:1.5;}
 .res .fix{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:9px 11px;margin:0 0 8px;}
 .res .fix .o{color:var(--red);font-size:12px;} .res .fix .s{color:var(--green);font-size:12.5px;margin-top:3px;}
@@ -132,6 +134,10 @@ def render_trace(events: list[dict]) -> str:
         elif t == "memory":
             rows.append(f"<div class='ev'><div class='who'>memory</div>"
                         f"<div class='txt'>{_esc(e['msg'])}</div></div>")
+        elif t == "intent":
+            rows.append(f"<div class='ev'><div class='who'>intent</div>"
+                        f"<div class='txt'><span class='chip'>{_esc(e.get('mode'))}</span>"
+                        f"{_esc(e.get('restate', ''))}</div></div>")
         elif t == "research":
             rows.append(f"<div class='ev'><div class='who'>prior art</div>"
                         f"<div class='txt'>{e['count']} existing tools &middot; top: "
@@ -179,13 +185,23 @@ def render_results(final: dict) -> tuple[str, str, str]:
     if not final:
         empty = "<div class='res'><p class='meter-sub'>No result yet.</p></div>"
         return empty, empty, empty
-    plan = "".join(f"<li>{_esc(p)}</li>" for p in final.get("ranked_plan", []))
+    mode = final.get("mode", "")
+    body = final.get("key_points") or final.get("ranked_plan", [])
+    body_heading = {"brainstorm": "Ideas", "decision": "Why &amp; trade-offs",
+                    "analysis": "The reasoning", "build": "Plan",
+                    "comparison": "Comparison", "factual": "Details"}.get(mode, "Key points")
+    direct = final.get("direct_answer", "")
+    points = "".join(f"<li>{_esc(p)}</li>" for p in body)
     fixes = "".join(f"<div class='fix'><div class='o'>&#9888; {_esc(f.get('objection',''))}</div>"
                     f"<div class='s'>&#10003; {_esc(f.get('solution',''))}</div></div>"
                     for f in final.get("fixes", []))
     tools = "".join(f"<span class='tag'>{_esc(t)}</span>" for t in final.get("builds_on", []))
-    plan_html = (f"<div class='res'><h3>Ranked plan &middot; confidence {final.get('confidence')}</h3>"
-                 f"<ol>{plan}</ol>"
+    lead = (f"<div class='answer'><div class='who' style='color:var(--amber)'>"
+            f"ANSWER{(' &middot; ' + _esc(mode)) if mode else ''} &middot; confidence "
+            f"{final.get('confidence')}</div><div class='atxt'>{_esc(direct)}</div></div>"
+            if direct else "")
+    plan_html = (f"<div class='res'>{lead}"
+                 + (f"<h3 style='margin-top:14px'>{body_heading}</h3><ol>{points}</ol>" if points else "")
                  + (f"<h3 style='margin-top:14px'>Solutions to objections</h3>{fixes}" if fixes else "")
                  + (f"<h3 style='margin-top:14px'>Builds on</h3>{tools}" if tools else "") + "</div>")
 

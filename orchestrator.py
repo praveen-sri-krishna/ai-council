@@ -53,6 +53,8 @@ def _console(e: dict) -> None:
         print(e["name"])
     elif t == "memory":
         print(f"  [memory] {e['msg']}")
+    elif t == "intent":
+        print(f"  [intent] mode={e.get('mode')} | {e.get('restate', '')[:80]}")
     elif t == "research":
         print(f"  [research] {e['count']} existing tools found; top: {e['top']}")
     elif t == "propose":
@@ -97,6 +99,22 @@ def ask_json(seat, system: str, user: str, defaults: dict, max_tokens: int | Non
     return data, text
 
 
+def _as_text(x) -> str:
+    """Models sometimes return a field as a dict/list instead of a string. Coerce
+    to text so downstream slicing/rendering never crashes."""
+    if isinstance(x, str):
+        return x
+    if x is None:
+        return ""
+    return json.dumps(x, ensure_ascii=False)
+
+
+def _as_list(x) -> list:
+    if isinstance(x, list):
+        return x
+    return [x] if x else []
+
+
 def pick_chair(seats: list):
     for role in ("chair", "generalist"):
         for s in seats:
@@ -111,6 +129,42 @@ def pick_researcher(seats: list):
             if s.role == role:
                 return s
     return seats[0]
+
+
+# --- Phase 0a: classify intent (so the answer matches the question) -------
+
+MODE_SHAPES = {
+    "brainstorm": "a spread of distinct, divergent ideas/options — explore, don't converge to one",
+    "decision": "a clear, decisive recommendation up front, then the few reasons and key trade-offs",
+    "analysis": "explain the 'why' directly first, then the implications that follow from it",
+    "build": "a concrete ordered plan of steps",
+    "comparison": "a side-by-side of the options, then a clear verdict",
+    "factual": "a direct, concise answer to exactly what was asked",
+}
+
+
+def phase_classify(idea: str, seat, mp: MemoryPalace, defaults: dict) -> dict:
+    """Read the question's intent so the council answers in the RIGHT shape and
+    leads with a direct answer instead of a generic data dump."""
+    system = (
+        "Classify the user's question so a panel answers it in the right shape. "
+        "Pick mode from: brainstorm, decision, analysis, build, comparison, factual. "
+        'ONLY JSON: {"mode": "<one>", "restate": "<one line: what they actually want>", '
+        '"answer_shape": "<how the answer should look>"}'
+    )
+    data, _ = ask_json(seat, system, f"Question: {idea}", defaults, max_tokens=600)
+    intent = data or {"mode": "analysis", "restate": idea, "answer_shape": MODE_SHAPES["analysis"]}
+    if intent.get("mode") not in MODE_SHAPES:
+        intent["mode"] = "analysis"
+    intent.setdefault("answer_shape", MODE_SHAPES[intent["mode"]])
+    mp.research["intent"] = intent
+    emit({"type": "intent", "mode": intent["mode"], "restate": intent.get("restate", "")})
+    return intent
+
+
+def _intent(mp: MemoryPalace) -> dict:
+    return mp.research.get("intent") or {"mode": "analysis", "restate": mp.prompt,
+                                         "answer_shape": MODE_SHAPES["analysis"]}
 
 
 # --- Phase 0: research + prior art ---------------------------------------
@@ -135,8 +189,9 @@ def phase_research(idea: str, researcher, mp: MemoryPalace, cfg) -> None:
     for q in (data.get("context_queries") or [])[:2]:
         context.append({"query": q, "results": search_web(q, max_results=4, provider=provider)})
 
-    mp.research = {"queries": data, "prior_art": prior_art, "context": context,
-                   "verdicts": [], "evidence_ratio": None}
+    mp.research.update({"queries": data, "prior_art": prior_art, "context": context})
+    mp.research.setdefault("verdicts", [])
+    mp.research.setdefault("evidence_ratio", None)
     mp.log("researcher", f"prior_art={len(prior_art)} repos, context_queries={len(context)}")
     emit({"type": "research", "count": len(prior_art),
           "top": prior_art[0]["repo"] if prior_art else "none", "prior_art": prior_art})
@@ -160,12 +215,14 @@ def phase_propose(idea: str, seats: list, mp: MemoryPalace, defaults: dict,
     if use_research:
         extra += ("\n\nExisting tools/prior art (build ON these where sensible, "
                   "don't reinvent):\n" + _prior_art_brief(mp))
+    intent = _intent(mp)
     for s in seats:
         system = (
             f"You are a {s.role} on an expert council. {s.personality} "
-            "Give your independent best plan. Where a proven existing tool fits, adopt or "
-            "build on it rather than reinventing. Do not hedge. "
-            'Respond ONLY as JSON: {"proposal": "<concise plan>", '
+            f"ANSWER THE ACTUAL QUESTION (\"{intent.get('restate', idea)}\") in this shape: "
+            f"{intent.get('answer_shape')}. Lead with your direct answer, not preamble. "
+            "Where a proven existing tool fits, adopt or build on it rather than reinventing. "
+            'Respond ONLY as JSON: {"proposal": "<your direct answer in the right shape>", '
             '"reasoning": "<why>", "builds_on": ["<existing tool/repo if any>"], '
             '"claims_to_verify": ["<checkable factual claim>", ...]}'
         )
@@ -173,10 +230,13 @@ def phase_propose(idea: str, seats: list, mp: MemoryPalace, defaults: dict,
         if not data:
             data = {"proposal": raw[:800], "reasoning": "(unparsed)",
                     "builds_on": [], "claims_to_verify": []}
+        data["proposal"] = _as_text(data.get("proposal", ""))
+        data["builds_on"] = _as_list(data.get("builds_on", []))
+        data["claims_to_verify"] = _as_list(data.get("claims_to_verify", []))
         mp.add_proposal(s.id, s.role, data)
-        mp.log(s.id, f"proposed: {data.get('proposal', '')[:160]}")
+        mp.log(s.id, f"proposed: {data['proposal'][:160]}")
         emit({"type": "propose", "seat": s.id, "role": s.role,
-              "proposal": data.get("proposal", ""), "builds_on": data.get("builds_on", [])})
+              "proposal": data["proposal"], "builds_on": data["builds_on"]})
 
 
 # --- Phase 2: critique ----------------------------------------------------
@@ -270,8 +330,8 @@ def phase_revise(seats: list, mp: MemoryPalace, defaults: dict, grounded: bool) 
                            "objections": objections, "evidence": evidence}, indent=2)[:9000]
         data, _ = ask_json(s, system, user, defaults)
         if data and data.get("proposal"):
-            mp.proposals[s.id]["proposal"] = data["proposal"]
-            mp.proposals[s.id]["reasoning"] = data.get("reasoning", mine.get("reasoning", ""))
+            mp.proposals[s.id]["proposal"] = _as_text(data["proposal"])
+            mp.proposals[s.id]["reasoning"] = _as_text(data.get("reasoning", mine.get("reasoning", "")))
     emit({"type": "revise", "n": len(seats)})
 
 
@@ -304,15 +364,21 @@ def _objections(mp: MemoryPalace, best: dict | None) -> list[str]:
 
 
 def phase_synthesize(chair, mp: MemoryPalace, best: dict | None, defaults: dict) -> dict:
+    intent = _intent(mp)
     system = (
-        f"You are the chair. {chair.personality} Produce ONE ranked plan the panel will accept. "
-        "PRIORITY: for each objection, devise a CONCRETE solution that fixes that specific fault "
-        "and fold it into the plan -- do not merely restate or drop the contested part. Base "
-        "claims on the verified evidence (drop refuted ones). Build on the listed existing tools "
-        "where sensible. ONLY JSON: "
-        '{"fixes": [{"objection": "<the fault>", "solution": "<concrete change that resolves it>"}], '
-        '"ranked_plan": ["step", ...], "builds_on": ["existing tool", ...], '
-        '"dissent": ["disagreement that genuinely could NOT be resolved", ...], '
+        f"You are the chair. {chair.personality} The user asked (mode={intent['mode']}): "
+        f"\"{intent.get('restate', mp.prompt)}\". Answer it in this shape: {intent.get('answer_shape')}.\n"
+        "FIRST give `direct_answer`: 2-4 sentences that directly and decisively answer the user's "
+        "actual question in that shape (NOT a generic plan) -- this is what they read first. "
+        "THEN `key_points`: the supporting detail, also in that shape (ideas if brainstorm, steps "
+        "if build, the recommendation's reasons+trade-offs if decision, the explanation if analysis). "
+        "For each objection, fold in a CONCRETE fix. Base claims on verified evidence (drop refuted). "
+        "ONLY JSON: "
+        '{"direct_answer": "<the answer, up front, in the right shape>", '
+        '"key_points": ["<supporting point>", ...], '
+        '"fixes": [{"objection": "<fault>", "solution": "<concrete fix>"}], '
+        '"builds_on": ["existing tool", ...], '
+        '"dissent": ["disagreement that could NOT be resolved", ...], '
         '"confidence": 0.0, "rationale": ""}'
     )
     objections = _objections(mp, best)
@@ -323,12 +389,15 @@ def phase_synthesize(chair, mp: MemoryPalace, best: dict | None, defaults: dict)
         "prior_art": _prior_art_brief(mp),
     }
     if best is not None:
-        payload["current_best_plan"] = best["proposal"].get("ranked_plan", [])
-        payload["instruction"] = ("Resolve every objection in objections_to_resolve with a "
-                                  "concrete fix, then output the improved plan. Keep what works.")
+        payload["current_best_answer"] = {
+            "direct_answer": best["proposal"].get("direct_answer", ""),
+            "key_points": best["proposal"].get("key_points", best["proposal"].get("ranked_plan", [])),
+        }
+        payload["instruction"] = ("Resolve every objection with a concrete fix, then output the "
+                                  "improved answer. Keep what works; keep leading with direct_answer.")
     data, raw = ask_json(chair, system, json.dumps(payload, indent=2)[:12000], defaults)
-    return data or {"fixes": [], "ranked_plan": [raw[:800]], "builds_on": [], "dissent": [],
-                    "confidence": 0.0, "rationale": "(unparsed)"}
+    return data or {"direct_answer": raw[:800], "key_points": [], "fixes": [], "builds_on": [],
+                    "dissent": [], "confidence": 0.0, "rationale": "(unparsed)"}
 
 
 # --- Phase 6: vote --------------------------------------------------------
@@ -341,12 +410,13 @@ def synth_with_failover(primary, mp: MemoryPalace, best: dict | None,
     synth = None
     for s in order:
         synth = phase_synthesize(s, mp, best, defaults)
-        if synth.get("ranked_plan") and synth.get("rationale") != "(unparsed)":
+        usable = synth.get("direct_answer") or synth.get("key_points") or synth.get("ranked_plan")
+        if usable and synth.get("rationale") != "(unparsed)":
             if s.id != primary.id:
                 emit({"type": "phase", "name": f"  (chair failover -> {s.id})"})
             return synth
-    return synth or {"fixes": [], "ranked_plan": [], "builds_on": [], "dissent": [],
-                     "confidence": 0.0, "rationale": "(all seats failed)"}
+    return synth or {"direct_answer": "", "key_points": [], "fixes": [], "builds_on": [],
+                     "dissent": [], "confidence": 0.0, "rationale": "(all seats failed)"}
 
 
 def phase_vote(synthesis: dict, seats: list, defaults: dict) -> dict:
@@ -376,11 +446,13 @@ def phase_lateral(idea: str, dissenter, mp: MemoryPalace, defaults: dict) -> Non
     user = f"Problem: {idea}\n\nPrior art:\n{_prior_art_brief(mp)}"
     data, raw = ask_json(dissenter, system, user, defaults)
     if data and data.get("proposal"):
+        data["proposal"] = _as_text(data["proposal"])
+        data["builds_on"] = _as_list(data.get("builds_on", []))
         key = f"lateral-{sum(1 for k in mp.proposals if k.startswith('lateral'))+1}"
         mp.add_proposal(key, "lateral", data)
         mp.log(key, f"lateral: {data['proposal'][:140]}")
         emit({"type": "lateral", "key": key, "proposal": data["proposal"],
-              "builds_on": data.get("builds_on", [])})
+              "builds_on": data["builds_on"]})
 
 
 def consensus_penalty(scores: list[float]) -> float:
@@ -424,6 +496,9 @@ def run_debate(idea: str, seats: list, cfg, session_path: str | None = None) -> 
     if mp.research["past_cases"]:
         emit({"type": "memory", "msg": f"recalled {len(mp.research['past_cases'])} past case(s)"})
 
+    # Classify intent first so every phase answers the question in the right shape.
+    emit({"type": "phase", "name": "CLASSIFY"}); phase_classify(idea, researcher, mp, d)
+
     if grounded:
         emit({"type": "phase", "name": "RESEARCH"}); phase_research(idea, researcher, mp, cfg)
     emit({"type": "phase", "name": "PROPOSE"}); phase_propose(idea, seats, mp, d, use_research=grounded)
@@ -462,9 +537,15 @@ def run_debate(idea: str, seats: list, cfg, session_path: str | None = None) -> 
     dissent_id = min(best["votes"], key=lambda k: best["votes"][k]["score"])
     leaderboard = compute_leaderboard(mp)
     best_model = next(iter(leaderboard), chair.id)
+    bp = best["proposal"]
+    body = [_as_text(p) for p in _as_list(bp.get("key_points") or bp.get("ranked_plan", []))]
     mp.final = {
-        "ranked_plan": best["proposal"].get("ranked_plan", []),
-        "fixes": best["proposal"].get("fixes", []),
+        "mode": _intent(mp).get("mode"),
+        "question": _intent(mp).get("restate", mp.prompt),
+        "direct_answer": _as_text(bp.get("direct_answer", "")),
+        "ranked_plan": body,            # back-compat key; holds the mode-shaped body
+        "key_points": body,
+        "fixes": bp.get("fixes", []),
         "builds_on": best["proposal"].get("builds_on", []),
         "dissent": best["proposal"].get("dissent", []),
         "confidence": round(best["adjusted"], 3),
