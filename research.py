@@ -6,12 +6,23 @@ DuckDuckGo later behind the same search_web() signature. Caching avoids
 re-spending quota on a repeated query.
 """
 import json
+import os
+import re
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 _CACHE_PATH = Path("sessions/.search_cache.json")
+# Authenticated GitHub search = 30 req/min (vs 10 unauth) -> far fewer rate-limit []s.
+_GH_TOKEN = os.environ.get("Github_API_KEY") or os.environ.get("GITHUB_TOKEN") or ""
+_STOP = {"recommend", "architecture", "design", "build", "create", "with", "that",
+         "this", "without", "across", "their", "for", "the", "and", "app", "using",
+         "use", "how", "should", "small", "teams", "team", "best", "system"}
 
 
 def _load_cache() -> dict:
@@ -27,12 +38,13 @@ _CACHE = _load_cache()
 
 
 def _cached(key: str, fn):
-    if key in _CACHE:
+    if _CACHE.get(key):  # only trust non-empty cache hits
         return _CACHE[key]
     val = fn()
-    _CACHE[key] = val
-    _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _CACHE_PATH.write_text(json.dumps(_CACHE, ensure_ascii=False), encoding="utf-8")
+    if val:  # never cache empty results -> a transient 0 won't stick across runs
+        _CACHE[key] = val
+        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CACHE_PATH.write_text(json.dumps(_CACHE, ensure_ascii=False), encoding="utf-8")
     return val
 
 
@@ -60,27 +72,35 @@ def search_web(query: str, max_results: int = 5, provider: str = "duckduckgo") -
 def _github_once(query: str, max_results: int) -> list[dict]:
     url = ("https://api.github.com/search/repositories?q="
            + urllib.parse.quote(query) + f"&sort=stars&per_page={max_results}")
-    req = urllib.request.Request(
-        url, headers={"User-Agent": UA, "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=20) as r:
+    headers = {"User-Agent": UA, "Accept": "application/vnd.github+json"}
+    if _GH_TOKEN:
+        headers["Authorization"] = f"Bearer {_GH_TOKEN}"
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as r:
         d = json.loads(r.read())
     return [{"repo": it["full_name"], "stars": it["stargazers_count"],
              "url": it["html_url"], "desc": (it.get("description") or "")[:200]}
             for it in d.get("items", [])[:max_results]]
 
 
+def _keywords(query: str, cap: int = 5) -> list[str]:
+    """Distil a query to its few most meaningful terms. GitHub ANDs all terms, so
+    a long sentence matches nothing -- and one call per word blows the rate limit."""
+    terms = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9+#.-]{2,}", query)
+             if w.lower() not in _STOP]
+    return terms[:cap] or re.findall(r"[A-Za-z]{3,}", query)[:3]
+
+
 def github_prior_art(query: str, max_results: int = 5) -> list[dict]:
-    """What already exists on GitHub for this idea -- so the council builds on
-    proven work instead of reinventing it. GitHub ANDs all terms, so a long
-    query matches nothing; we progressively drop terms until results appear."""
+    """What already exists on GitHub for this idea, so the council builds on proven
+    work. Distil to <=5 keywords, then relax to 2 (bounded ~4 calls, authenticated)."""
     def run() -> list[dict]:
-        terms = query.split()
-        while terms:
+        terms = _keywords(query)
+        while len(terms) >= 2:
             hits = _github_once(" ".join(terms), max_results)
             if hits:
                 return hits
-            terms = terms[:-1]  # relax: drop the most specific (last) term
-        return []
+            terms = terms[:-1]
+        return _github_once(terms[0], max_results) if terms else []
     try:
         return _cached(f"gh::{query}", run)
     except Exception:

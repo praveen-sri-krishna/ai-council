@@ -292,6 +292,10 @@ def _objections(mp: MemoryPalace, best: dict | None) -> list[str]:
                             out.append(c[fld])
     seen, uniq = set(), []
     for o in out:
+        # models format these fields as str OR list -> coerce to a clean string
+        if isinstance(o, list):
+            o = "; ".join(str(x) for x in o)
+        o = str(o).strip()
         k = o[:80]
         if o and k not in seen:
             seen.add(k)
