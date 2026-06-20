@@ -351,5 +351,7 @@ def build() -> gr.Blocks:
 
 
 if __name__ == "__main__":
+    # share=True needs Gradio's tunnel binary (may be network-blocked). The public
+    # showcase lives on GitHub Pages (docs/, built by build_site.py); this serves locally.
     build().launch(server_name="127.0.0.1", server_port=7860, inbrowser=True,
                    css=CSS, theme=gr.themes.Base())
