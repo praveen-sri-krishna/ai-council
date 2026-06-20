@@ -70,11 +70,22 @@ color:var(--muted);margin-left:6px;}
 .res ol{padding-left:18px;margin:0;} .res li{margin:0 0 9px;font-size:13.5px;line-height:1.5;}
 .res .fix{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:9px 11px;margin:0 0 8px;}
 .res .fix .o{color:var(--red);font-size:12px;} .res .fix .s{color:var(--green);font-size:12.5px;margin-top:3px;}
-.lb-row{display:flex;align-items:center;gap:10px;margin:6px 0;}
-.lb-bar{height:10px;background:linear-gradient(90deg,var(--amber2),var(--amber));border-radius:6px;}
+.lb-row{display:flex;align-items:center;gap:10px;margin:6px 0;flex-wrap:wrap;}
+.lb-bar{height:10px;max-width:55%;background:linear-gradient(90deg,var(--amber2),var(--amber));border-radius:6px;}
 .lb-name{width:150px;font-size:12.5px;} .lb-name .crown{color:var(--amber);}
 .tag{display:inline-block;background:var(--panel2);border:1px solid var(--line);border-radius:20px;
 padding:2px 10px;font-size:11.5px;margin:3px 4px 0 0;color:var(--text);}
+/* --- mobile --- */
+@media (max-width:760px){
+  .gradio-container{padding:0 6px!important;}
+  #sr-head h1{font-size:26px;}
+  #trace{height:300px;}
+  .lb-name{width:92px;font-size:11.5px;}
+  .lb-bar{max-width:40vw;}
+  .stat .n{font-size:24px;}
+  .meter-num{font-size:34px;}
+  .res li{font-size:13px;}
+}
 """
 
 
@@ -213,16 +224,22 @@ def run_debate_stream(idea: str, privacy: str, selected: list[str]):
     cfg = load_config()
     cfg.privacy_mode = privacy
     avail = {s.id: s for s in available_seats(cfg)}
-    seats = [avail[i] for i in selected if i in avail]
+    seats = [avail[i] for i in (selected or []) if i in avail]
+    # Don't dead-end: if the picked seats resolve to <2 but the env has enough,
+    # just run with all available seats.
+    if len(seats) < 2 and len(avail) >= 2:
+        seats = list(avail.values())
     blank = render_results({})
-    if len(seats) < 2:
-        yield (render_trace([{"type": "error", "msg": "Pick at least 2 available seats "
-                              "(hosted seats need their API key; local need Ollama)."}]),
-               render_meter(None, cfg.consensus_threshold, []), *blank)
-        return
 
     if not idea.strip():
         yield (render_trace([{"type": "error", "msg": "Enter an idea or problem to deliberate."}]),
+               render_meter(None, cfg.consensus_threshold, []), *blank)
+        return
+    if len(seats) < 2:
+        why = ("No local seats available — start Ollama with the models in config.yaml."
+               if privacy == "local_only" else
+               "No seats available — add API keys to .env (open mode) or start Ollama.")
+        yield (render_trace([{"type": "error", "msg": why}]),
                render_meter(None, cfg.consensus_threshold, []), *blank)
         return
 
@@ -259,6 +276,26 @@ def run_debate_stream(idea: str, privacy: str, selected: list[str]):
                *render_results(final))
     yield (render_trace(events), render_meter(best, cfg.consensus_threshold, rounds),
            *render_results(final))
+
+
+def load_latest_result():
+    """Recover the most recent finished debate. The debate runs in a daemon thread
+    that completes + saves even if the (tunnel/mobile) stream connection drops, so
+    this button retrieves the result after any disconnect."""
+    cfg = load_config()
+    sess = list_sessions()
+    if not sess:
+        return (render_trace([{"type": "error", "msg": "No finished debates yet. If one is "
+                               "running, give it ~3 min, then load."}]),
+                render_meter(None, cfg.consensus_threshold, []), *render_results({}))
+    s = load_session(sess[0])
+    final = s.get("final", {})
+    rounds = [{"n": i + 1, "best": r["adjusted"]} for i, r in enumerate(s.get("synthesis", []))]
+    best = rounds[-1]["best"] if rounds else final.get("confidence")
+    ev = [{"type": "phase", "name": "LOADED LATEST RESULT"},
+          {"type": "memory", "msg": s.get("prompt", "")[:140]}]
+    return (render_trace(ev), render_meter(best, cfg.consensus_threshold, rounds),
+            *render_results(final))
 
 
 # ---------- leader chat ----------
@@ -316,6 +353,10 @@ def build() -> gr.Blocks:
                                        label="Privacy mode")
                     seats = gr.CheckboxGroup(seat_ids, value=default_sel, label="Seats")
                     run = gr.Button("Convene the council", variant="primary")
+                    load = gr.Button("Load latest result")
+                    gr.HTML("<p class='note'>A debate takes ~2-4 min. It finishes on the "
+                            "server even if your connection drops &mdash; tap <b>Load latest "
+                            "result</b> to fetch it.</p>")
                     meter = gr.HTML(render_meter(None, cfg.consensus_threshold, []))
                 with gr.Column(scale=6):
                     gr.HTML("<p class='sr-label'>Live deliberation</p>")
@@ -327,8 +368,9 @@ def build() -> gr.Blocks:
                     evidence = gr.HTML(render_results({})[1])
                 with gr.Column():
                     leaderboard = gr.HTML(render_results({})[2])
-            run.click(run_debate_stream, [idea, privacy, seats],
-                      [trace, meter, plan, evidence, leaderboard])
+            outs = [trace, meter, plan, evidence, leaderboard]
+            run.click(run_debate_stream, [idea, privacy, seats], outs)
+            load.click(load_latest_result, None, outs)
 
         with gr.Tab("Leader chat"):
             gr.HTML("<p class='sr-label'>Brief the leader 1:1 — they answer, "
@@ -347,6 +389,7 @@ def build() -> gr.Blocks:
             send.click(on_leader_msg, [sess, msg, chat], [chat, msg])
             msg.submit(on_leader_msg, [sess, msg, chat], [chat, msg])
 
+    app.queue(default_concurrency_limit=4)  # required for reliable streaming generators
     return app
 
 
