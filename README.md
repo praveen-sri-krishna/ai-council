@@ -7,6 +7,14 @@ free hosted APIs. Designed to cost ~$0 to operate.
 
 ![status](https://img.shields.io/badge/status-working-3ecf8e) ![python](https://img.shields.io/badge/python-3.11%2B-blue)
 
+## Demo
+
+See a real run without installing anything:
+- [`demo/phase3_demo.json`](demo/phase3_demo.json) — a full debate (proposals,
+  critiques, evidence verdicts, monotonic rounds, leaderboard, minority report).
+- [`demo/eval_demo_result.json`](demo/eval_demo_result.json) — the eval harness
+  scoring **council 43 vs single model 36** on a rubric.
+
 ## What it does
 
 A debate runs through these phases:
