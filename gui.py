@@ -322,10 +322,13 @@ def on_leader_msg(path: str, msg: str, history: list):
     pairs = [(history[i]["content"], history[i + 1]["content"])
              for i in range(0, len(history) - 1, 2)]
     res = leader_chat(s, msg, pairs)
-    tag = ""
+    notes = []
     if res.get("decision") == "consult_group":
         names = ", ".join(g["seat"] for g in res.get("group", []))
-        tag = f"\n\n_— consulted the group ({names})_"
+        notes.append(f"consulted the group ({names})")
+    if res.get("researched"):
+        notes.append(f"researched: {res['researched']}")
+    tag = f"\n\n_— {' · '.join(notes)}_" if notes else ""
     history.append({"role": "user", "content": msg})
     history.append({"role": "assistant", "content": res.get("answer", "") + tag})
     return history, ""
