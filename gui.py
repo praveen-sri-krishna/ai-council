@@ -17,6 +17,7 @@ from pathlib import Path
 import gradio as gr
 
 import orchestrator
+from documents import generate_document, list_documents
 from leader import leader_chat, leader_id, load_session
 from seats import available_seats, load_config
 
@@ -354,9 +355,45 @@ def refresh_view():
 
 # ---------- leader chat ----------
 
-def list_sessions() -> list[str]:
-    return sorted([str(p) for p in SESSIONS.glob("*.json")
-                   if not p.name.startswith(".")], reverse=True)
+def _session_label(p: Path) -> str:
+    """Human-readable dropdown label: idea + mode/verdict + date (not session_123.json)."""
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        idea = (d.get("prompt") or "").strip()
+        short = idea[:60] + ("…" if len(idea) > 60 else "")
+        f = d.get("final", {})
+        tag = " · ".join(x for x in [f.get("mode", ""),
+                                     (f.get("verdict") or {}).get("call", "")] if x)
+        ds = p.stem.replace("session_", "")
+        when = f"{ds[4:6]}-{ds[6:8]} {ds[9:11]}:{ds[11:13]}" if len(ds) >= 13 else ds
+        return f"{short or p.stem}" + (f"  [{tag}]" if tag else "") + f"  ({when})"
+    except Exception:
+        return p.name
+
+
+def list_sessions() -> list[tuple[str, str]]:
+    """(readable label, path) tuples for the dropdown, newest first."""
+    paths = [p for p in SESSIONS.glob("*.json") if not p.name.startswith(("_", "."))]
+    return [(_session_label(p), str(p)) for p in sorted(paths, reverse=True)]
+
+
+def on_generate_doc(path: str):
+    """Ask the leader to write a full presentable document for this debate."""
+    if not path or not Path(path).exists():
+        return "_Pick a session first._", gr.update()
+    try:
+        doc_path, _ = generate_document(path)
+        return (f"Document saved: **{Path(doc_path).name}** — open the Library tab to read/download.",
+                gr.update(choices=list_documents()))
+    except Exception as e:
+        return f"_Could not generate: {type(e).__name__}_", gr.update()
+
+
+def on_pick_document(path: str):
+    """Preview a saved document + expose it for download."""
+    if not path or not Path(path).exists():
+        return "_No document selected._", None
+    return Path(path).read_text(encoding="utf-8"), path
 
 
 def on_pick_session(path: str) -> str:
@@ -443,10 +480,27 @@ def build() -> gr.Blocks:
                 msg = gr.Textbox(placeholder="Ask the leader about the plan, a dropped idea, "
                                  "a trade-off…", show_label=False, scale=5)
                 send = gr.Button("Send", variant="primary", scale=1)
+            with gr.Row():
+                gen_doc = gr.Button("📄 Turn this into a document", variant="secondary")
+                doc_status = gr.Markdown("")
             refresh.click(lambda: gr.update(choices=list_sessions()), None, sess)
             sess.change(on_pick_session, sess, who)
             send.click(on_leader_msg, [sess, msg, chat], [chat, msg])
             msg.submit(on_leader_msg, [sess, msg, chat], [chat, msg])
+
+        with gr.Tab("Library"):
+            gr.HTML("<p class='sr-label'>Your saved idea documents — preview & download</p>")
+            with gr.Row():
+                doc_sel = gr.Dropdown(list_documents(), label="Document", scale=4)
+                doc_refresh = gr.Button("↻", scale=1)
+            doc_file = gr.File(label="Download", interactive=False)
+            doc_view = gr.Markdown("_Generate a document from the Leader chat tab, "
+                                   "then pick it here._")
+            doc_refresh.click(lambda: gr.update(choices=list_documents()), None, doc_sel)
+            doc_sel.change(on_pick_document, doc_sel, [doc_view, doc_file])
+
+        # Wired after the Library tab so the generate button can refresh its dropdown.
+        gen_doc.click(on_generate_doc, sess, [doc_status, doc_sel])
 
     app.queue(default_concurrency_limit=4)  # required for reliable streaming generators
     return app
