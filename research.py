@@ -69,16 +69,19 @@ def search_web(query: str, max_results: int = 5, provider: str = "duckduckgo") -
         return []
 
 
-def _github_once(query: str, max_results: int) -> list[dict]:
+def _github_once(query: str, max_results: int, sort: str = "stars") -> list[dict]:
+    # sort=stars -> most proven; sort=updated -> most recently active (latest/trending)
+    extra = f"&sort={sort}" if sort in ("stars", "updated", "forks") else ""
     url = ("https://api.github.com/search/repositories?q="
-           + urllib.parse.quote(query) + f"&sort=stars&per_page={max_results}")
+           + urllib.parse.quote(query) + f"{extra}&per_page={max_results}")
     headers = {"User-Agent": UA, "Accept": "application/vnd.github+json"}
     if _GH_TOKEN:
         headers["Authorization"] = f"Bearer {_GH_TOKEN}"
     with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as r:
         d = json.loads(r.read())
     return [{"repo": it["full_name"], "stars": it["stargazers_count"],
-             "url": it["html_url"], "desc": (it.get("description") or "")[:200]}
+             "url": it["html_url"], "desc": (it.get("description") or "")[:200],
+             "updated": (it.get("pushed_at") or "")[:10]}
             for it in d.get("items", [])[:max_results]]
 
 
@@ -90,19 +93,19 @@ def _keywords(query: str, cap: int = 5) -> list[str]:
     return terms[:cap] or re.findall(r"[A-Za-z]{3,}", query)[:3]
 
 
-def github_prior_art(query: str, max_results: int = 5) -> list[dict]:
-    """What already exists on GitHub for this idea, so the council builds on proven
-    work. Distil to <=5 keywords, then relax to 2 (bounded ~4 calls, authenticated)."""
+def github_prior_art(query: str, max_results: int = 5, sort: str = "stars") -> list[dict]:
+    """What exists on GitHub for this idea. sort=stars = most proven; sort=updated =
+    latest/trending. Distil to <=5 keywords, relax to 2 (bounded ~4 calls, authed)."""
     def run() -> list[dict]:
         terms = _keywords(query)
         while len(terms) >= 2:
-            hits = _github_once(" ".join(terms), max_results)
+            hits = _github_once(" ".join(terms), max_results, sort)
             if hits:
                 return hits
             terms = terms[:-1]
-        return _github_once(terms[0], max_results) if terms else []
+        return _github_once(terms[0], max_results, sort) if terms else []
     try:
-        return _cached(f"gh::{query}", run)
+        return _cached(f"gh::{sort}::{query}", run)
     except Exception:
         return []
 

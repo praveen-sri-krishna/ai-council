@@ -73,12 +73,14 @@ class Config:
 def load_config(path: str = "config.yaml") -> Config:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     seats = [Seat(**s) for s in raw.get("seats", [])]
+    defaults = raw.get("defaults", {})
+    defaults["charter"] = raw.get("council_charter", "")  # reasoning OS for every seat
     return Config(
         privacy_mode=raw.get("privacy_mode", "open"),
         consensus_threshold=raw.get("consensus_threshold", 0.95),
         max_iterations=raw.get("max_iterations", 4),
         history_compress_after=raw.get("history_compress_after", 15),
-        defaults=raw.get("defaults", {}),
+        defaults=defaults,
         search_provider=raw.get("search_provider", "duckduckgo"),
         seats=seats,
         failover=raw.get("failover", {}),

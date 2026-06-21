@@ -6,12 +6,11 @@ check so the panel builds on existing work, a consensus score that never
 decreases across rounds, and an out-of-the-box (lateral) pass when it stalls.
 """
 import json
-import re
 import sys
 from statistics import mean
 
 from memory import MemoryPalace, retrieve_cases, write_case
-from research import gather_evidence, github_prior_art, search_web
+from research import _keywords, gather_evidence, github_prior_art, search_web
 from seats import call_seat, extract_json
 
 # Windows console is cp1252; model output is full Unicode. Don't let a stray
@@ -80,6 +79,8 @@ def ask_json(seat, system: str, user: str, defaults: dict, max_tokens: int | Non
     """Resilient: call_seat already retries transient errors; if a seat still hard-
     fails (bad key, down provider), return (None, reason) so the debate degrades
     gracefully instead of crashing."""
+    charter = defaults.get("charter", "")
+    system = f"{charter}\n\n{system}" if charter else system
     msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     try:
         text = call_seat(seat, msgs, defaults, max_tokens=max_tokens)
@@ -172,36 +173,68 @@ def _intent(mp: MemoryPalace) -> dict:
 def phase_research(idea: str, researcher, mp: MemoryPalace, cfg) -> None:
     provider = getattr(cfg, "search_provider", "duckduckgo")
     system = (
-        "You turn a problem into search inputs. Respond ONLY as JSON: "
-        '{"github_query": "<keywords to find existing tools/repos>", '
+        "Turn the problem into search inputs to map the CURRENT landscape. Respond ONLY as JSON: "
+        '{"github_query": "<2-3 keywords for existing repos/tools>", '
+        '"competitor_query": "<query to find direct products/competitors and alternatives>", '
+        '"latest_query": "<query for the newest/trending tools in this field in 2026>", '
         '"context_queries": ["<web query>", "<web query>"]}'
     )
     data, _ = ask_json(researcher, system, f"Problem: {idea}", cfg.defaults)
-    data = data or {"github_query": idea, "context_queries": [idea]}
+    data = data or {}
 
-    prior_art = github_prior_art(data.get("github_query", idea), max_results=6)
-    if not prior_art:  # a long sentence query returns nothing; fall back to keywords
-        kws = [w for w in re.findall(r"[A-Za-z][A-Za-z0-9+#-]{3,}", idea)
-               if w.lower() not in ("design", "build", "create", "with", "that", "this",
-                                    "without", "across", "their")][:5]
-        prior_art = github_prior_art(" ".join(kws), max_results=6)
+    def kw_fallback() -> str:
+        return " ".join(_keywords(idea)[:4])
+
+    # Forced: proven prior art (by stars) + latest/trending (recently active) on GitHub.
+    prior_art = github_prior_art(data.get("github_query") or kw_fallback(), max_results=6)
+    if not prior_art:
+        prior_art = github_prior_art(kw_fallback(), max_results=6)
+    latest_repos = github_prior_art(data.get("latest_query") or (kw_fallback() + " 2026"),
+                                    max_results=6, sort="updated")
+    # Forced: web search for competitors + the latest/viral tools in the field.
+    competitors = search_web(data.get("competitor_query") or f"{idea} competitors alternatives 2026",
+                             max_results=5, provider=provider)
+    latest_web = search_web(data.get("latest_query") or f"{idea} new tools 2026 trending",
+                            max_results=5, provider=provider)
     context = []
     for q in (data.get("context_queries") or [])[:2]:
         context.append({"query": q, "results": search_web(q, max_results=4, provider=provider)})
 
-    mp.research.update({"queries": data, "prior_art": prior_art, "context": context})
+    mp.research.update({"queries": data, "prior_art": prior_art, "latest_repos": latest_repos,
+                        "competitors_raw": competitors, "latest_web": latest_web, "context": context})
     mp.research.setdefault("verdicts", [])
     mp.research.setdefault("evidence_ratio", None)
-    mp.log("researcher", f"prior_art={len(prior_art)} repos, context_queries={len(context)}")
-    emit({"type": "research", "count": len(prior_art),
-          "top": prior_art[0]["repo"] if prior_art else "none", "prior_art": prior_art})
+    mp.log("researcher", f"prior_art={len(prior_art)} latest={len(latest_repos)} "
+           f"competitors={len(competitors)}")
+    emit({"type": "research", "count": len(prior_art) + len(latest_repos),
+          "top": prior_art[0]["repo"] if prior_art else (latest_repos[0]["repo"] if latest_repos else "none"),
+          "prior_art": prior_art})
 
 
 def _prior_art_brief(mp: MemoryPalace, n: int = 5) -> str:
     pa = mp.research.get("prior_art", [])[:n]
-    if not pa:
-        return "(no prior-art results)"
-    return "\n".join(f"- {p['repo']} ({p['stars']} stars): {p['desc']}" for p in pa)
+    latest = mp.research.get("latest_repos", [])[:n]
+    out = []
+    if pa:
+        out.append("Proven (by stars):\n" + "\n".join(
+            f"- {p['repo']} ({p['stars']}*): {p['desc']}" for p in pa))
+    if latest:
+        out.append("Recently active / trending:\n" + "\n".join(
+            f"- {p['repo']} (updated {p.get('updated','?')}): {p['desc']}" for p in latest))
+    return "\n\n".join(out) or "(no prior-art results)"
+
+
+def _market_brief(mp: MemoryPalace) -> str:
+    comp = mp.research.get("competitors_raw", []) or []
+    latest = mp.research.get("latest_web", []) or []
+    out = []
+    if comp:
+        out.append("Competitors / products found:\n" + "\n".join(
+            f"- {c.get('title','')}: {c.get('snippet','')[:160]}" for c in comp[:5]))
+    if latest:
+        out.append("Latest/trending in the field:\n" + "\n".join(
+            f"- {c.get('title','')}: {c.get('snippet','')[:160]}" for c in latest[:5]))
+    return "\n\n".join(out) or "(no market data)"
 
 
 # --- Phase 1: propose -----------------------------------------------------
@@ -373,9 +406,18 @@ def phase_synthesize(chair, mp: MemoryPalace, best: dict | None, defaults: dict)
         "THEN `key_points`: the supporting detail, also in that shape (ideas if brainstorm, steps "
         "if build, the recommendation's reasons+trade-offs if decision, the explanation if analysis). "
         "For each objection, fold in a CONCRETE fix. Base claims on verified evidence (drop refuted). "
+        "Use the provided competitor/market research: name the REAL current competitors & tools, and "
+        "for each, state the concrete GAP this idea exploits. Then give clear `differentiators`: why "
+        "this delivers what those competitors/tools cannot. Be specific -- no buzzwords.\n"
+        "REALITY CHECK FIRST: give an honest `verdict` on whether this idea is even worth pursuing. "
+        "If the space is saturated, the odds are slim, or it's a weak idea, say so -- call=pivot or "
+        "drop -- and point to the better move. Do NOT default to 'pursue' to please the user. "
         "ONLY JSON: "
-        '{"direct_answer": "<the answer, up front, in the right shape>", '
+        '{"verdict": {"call": "pursue|pursue_with_changes|pivot|drop", "odds": "<blunt honest read of the chances>", "why": "<the deciding reason>"}, '
+        '"direct_answer": "<the answer, up front, in the right shape>", '
         '"key_points": ["<supporting point>", ...], '
+        '"competitors": [{"name": "<real product/tool>", "what_they_do": "", "gap": "<what they miss>"}], '
+        '"differentiators": ["<why ours wins where they cannot>", ...], '
         '"fixes": [{"objection": "<fault>", "solution": "<concrete fix>"}], '
         '"builds_on": ["existing tool", ...], '
         '"dissent": ["disagreement that could NOT be resolved", ...], '
@@ -387,6 +429,7 @@ def phase_synthesize(chair, mp: MemoryPalace, best: dict | None, defaults: dict)
         "proposals": {k: v["proposal"] for k, v in mp.proposals.items()},
         "evidence": _evidence_brief(mp),
         "prior_art": _prior_art_brief(mp),
+        "market_and_competitors": _market_brief(mp),
     }
     if best is not None:
         payload["current_best_answer"] = {
@@ -395,8 +438,9 @@ def phase_synthesize(chair, mp: MemoryPalace, best: dict | None, defaults: dict)
         }
         payload["instruction"] = ("Resolve every objection with a concrete fix, then output the "
                                   "improved answer. Keep what works; keep leading with direct_answer.")
-    data, raw = ask_json(chair, system, json.dumps(payload, indent=2)[:12000], defaults)
-    return data or {"direct_answer": raw[:800], "key_points": [], "fixes": [], "builds_on": [],
+    data, raw = ask_json(chair, system, json.dumps(payload, indent=2)[:14000], defaults)
+    return data or {"verdict": {}, "direct_answer": raw[:800], "key_points": [], "competitors": [],
+                    "differentiators": [], "fixes": [], "builds_on": [],
                     "dissent": [], "confidence": 0.0, "rationale": "(unparsed)"}
 
 
@@ -542,9 +586,12 @@ def run_debate(idea: str, seats: list, cfg, session_path: str | None = None) -> 
     mp.final = {
         "mode": _intent(mp).get("mode"),
         "question": _intent(mp).get("restate", mp.prompt),
+        "verdict": bp.get("verdict", {}) if isinstance(bp.get("verdict"), dict) else {},
         "direct_answer": _as_text(bp.get("direct_answer", "")),
         "ranked_plan": body,            # back-compat key; holds the mode-shaped body
         "key_points": body,
+        "competitors": bp.get("competitors", []),
+        "differentiators": bp.get("differentiators", []),
         "fixes": bp.get("fixes", []),
         "builds_on": best["proposal"].get("builds_on", []),
         "dissent": best["proposal"].get("dissent", []),

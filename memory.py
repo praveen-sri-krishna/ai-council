@@ -82,6 +82,7 @@ def write_case(mp: "MemoryPalace", limit_plan: int = 6) -> bool:
     body = {
         "idea": mp.prompt,
         "mode": final.get("mode"),
+        "verdict": final.get("verdict", {}),
         "direct_answer": final.get("direct_answer", ""),
         "ranked_plan": plan,
         "builds_on": final.get("builds_on", []),

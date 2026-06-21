@@ -19,6 +19,8 @@ def _seat_by_id(cfg: Config, sid: str) -> Seat | None:
 
 
 def _ask_json(seat: Seat, system: str, user: str, defaults: dict):
+    charter = defaults.get("charter", "")
+    system = f"{charter}\n\n{system}" if charter else system
     msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     text = call_seat(seat, msgs, defaults)
     data = extract_json(text)
@@ -34,6 +36,10 @@ def _context_brief(session: dict) -> str:
     proposals = {k: str(v.get("proposal", ""))[:300] for k, v in session.get("proposals", {}).items()}
     return json.dumps({
         "idea": session.get("prompt"),
+        "verdict": final.get("verdict"),
+        "direct_answer": final.get("direct_answer"),
+        "differentiators": final.get("differentiators"),
+        "competitors": final.get("competitors"),
         "final_plan": final.get("ranked_plan"),
         "builds_on": final.get("builds_on"),
         "unresolved_dissent": final.get("dissent"),
@@ -85,6 +91,7 @@ def leader_chat(session: dict, user_msg: str, history: list[tuple[str, str]],
     ctx = _context_brief(session)
     convo = "\n".join(f"{role}: {msg}" for role, msg in history[-6:])
     grounded = cfg.privacy_mode != "local_only"
+    charter = cfg.defaults.get("charter", "")
 
     system = (
         f"You are the LEADER of an AI council, chosen because you performed best in the debate. "
@@ -121,7 +128,7 @@ def leader_chat(session: dict, user_msg: str, history: list[tuple[str, str]],
         )
         payload = {"original_question": user_msg, "group_input": group,
                    "evidence": [e["snippet"][:200] for e in evidence]}
-        answer = call_seat(leader, [{"role": "system", "content": system2},
+        answer = call_seat(leader, [{"role": "system", "content": f"{charter}\n\n{system2}"},
                                     {"role": "user", "content": json.dumps(payload, indent=2)}],
                            cfg.defaults).strip()
         return {"leader": lid, "decision": "consult_group",
@@ -134,7 +141,7 @@ def leader_chat(session: dict, user_msg: str, history: list[tuple[str, str]],
                    f"decisive answer in clear prose (markdown ok) -- do not defer, do not output "
                    f"JSON. {leader.personality}")
         payload = {"question": user_msg, "evidence": [e["snippet"][:200] for e in evidence]}
-        answer = call_seat(leader, [{"role": "system", "content": system3},
+        answer = call_seat(leader, [{"role": "system", "content": f"{charter}\n\n{system3}"},
                                     {"role": "user", "content": json.dumps(payload, indent=2)}],
                            cfg.defaults).strip()
         return {"leader": lid, "decision": "answer", "group": [], "researched": rq,

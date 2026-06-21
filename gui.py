@@ -69,6 +69,8 @@ color:var(--muted);margin-left:6px;}
 .res h3{font-family:'Fraunces',serif;color:var(--amber);font-size:16px;margin:2px 0 10px;}
 .answer{background:rgba(255,176,0,.08);border:1px solid var(--amber);border-radius:10px;padding:13px 15px;margin-bottom:14px;}
 .answer .atxt{font-size:15px;line-height:1.55;margin-top:6px;color:var(--text);}
+.verdict{background:var(--panel2);border:2px solid var(--muted);border-radius:10px;padding:12px 15px;margin-bottom:12px;}
+.verdict .atxt{font-size:14px;line-height:1.5;margin-top:5px;color:var(--text);}
 .res ol{padding-left:18px;margin:0;} .res li{margin:0 0 9px;font-size:13.5px;line-height:1.5;}
 .res .fix{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:9px 11px;margin:0 0 8px;}
 .res .fix .o{color:var(--red);font-size:12px;} .res .fix .s{color:var(--green);font-size:12.5px;margin-top:3px;}
@@ -196,12 +198,30 @@ def render_results(final: dict) -> tuple[str, str, str]:
                     f"<div class='s'>&#10003; {_esc(f.get('solution',''))}</div></div>"
                     for f in final.get("fixes", []))
     tools = "".join(f"<span class='tag'>{_esc(t)}</span>" for t in final.get("builds_on", []))
+    diffs = "".join(f"<li>{_esc(d)}</li>" for d in final.get("differentiators", []))
+    comps = "".join(
+        f"<div class='fix'><div class='s'>{_esc(c.get('name',''))}</div>"
+        f"<div class='note'>{_esc(c.get('what_they_do',''))}</div>"
+        f"<div class='o'>gap: {_esc(c.get('gap',''))}</div></div>"
+        for c in final.get("competitors", []) if isinstance(c, dict))
+    v = final.get("verdict") or {}
+    call = str(v.get("call", "")).lower()
+    vcol = {"pursue": "var(--green)", "pursue_with_changes": "var(--amber)",
+            "pivot": "var(--amber)", "drop": "var(--red)"}.get(call, "var(--muted)")
+    vlabel = {"pursue": "PURSUE", "pursue_with_changes": "PURSUE — WITH CHANGES",
+              "pivot": "PIVOT", "drop": "DON'T BUILD THIS"}.get(call, call.upper())
+    verdict_html = (f"<div class='verdict' style='border-color:{vcol}'>"
+                    f"<div class='who' style='color:{vcol}'>REALITY CHECK &middot; {_esc(vlabel)}</div>"
+                    f"<div class='atxt'>{_esc(v.get('odds',''))} {_esc(v.get('why',''))}</div></div>"
+                    if call else "")
     lead = (f"<div class='answer'><div class='who' style='color:var(--amber)'>"
             f"ANSWER{(' &middot; ' + _esc(mode)) if mode else ''} &middot; confidence "
             f"{final.get('confidence')}</div><div class='atxt'>{_esc(direct)}</div></div>"
             if direct else "")
-    plan_html = (f"<div class='res'>{lead}"
+    plan_html = (f"<div class='res'>{verdict_html}{lead}"
                  + (f"<h3 style='margin-top:14px'>{body_heading}</h3><ol>{points}</ol>" if points else "")
+                 + (f"<h3 style='margin-top:14px'>Why this beats what exists</h3><ol>{diffs}</ol>" if diffs else "")
+                 + (f"<h3 style='margin-top:14px'>Competitors &amp; their gaps</h3>{comps}" if comps else "")
                  + (f"<h3 style='margin-top:14px'>Solutions to objections</h3>{fixes}" if fixes else "")
                  + (f"<h3 style='margin-top:14px'>Builds on</h3>{tools}" if tools else "") + "</div>")
 
