@@ -355,18 +355,38 @@ def refresh_view():
 
 # ---------- leader chat ----------
 
+import re as _re
+
+_FILLER = _re.compile(
+    r"^(so|okay|ok|hi|hey|um|uh|well)[ ,]+|"
+    r"^(here'?s|here is|i have|i'?ve|i want to|i wanna|i'?m thinking of|i am thinking of|"
+    r"what if|the idea is|my idea is|a new idea|new idea|can you|could you|i was wondering|"
+    r"what do you think(?: about| of)?)[ ,:-]*", _re.IGNORECASE)
+
+
+def core_idea(text: str, n: int = 9) -> str:
+    """Strip filler openers and return the gist (fallback when no LLM title exists)."""
+    t = (text or "").strip()
+    for _ in range(3):  # peel stacked openers ("so here is a new idea that...")
+        new = _FILLER.sub("", t, count=1).strip()
+        if new == t:
+            break
+        t = new
+    words = t.split()
+    return " ".join(words[:n]) + ("…" if len(words) > n else "")
+
+
 def _session_label(p: Path) -> str:
-    """Human-readable dropdown label: idea + mode/verdict + date (not session_123.json)."""
+    """Human-readable label from the CORE IDEA (title), not the opening words."""
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
-        idea = (d.get("prompt") or "").strip()
-        short = idea[:60] + ("…" if len(idea) > 60 else "")
         f = d.get("final", {})
+        name = (f.get("title") or "").strip() or core_idea(d.get("prompt", "")) or p.stem
         tag = " · ".join(x for x in [f.get("mode", ""),
                                      (f.get("verdict") or {}).get("call", "")] if x)
         ds = p.stem.replace("session_", "")
         when = f"{ds[4:6]}-{ds[6:8]} {ds[9:11]}:{ds[11:13]}" if len(ds) >= 13 else ds
-        return f"{short or p.stem}" + (f"  [{tag}]" if tag else "") + f"  ({when})"
+        return f"{name}" + (f"  [{tag}]" if tag else "") + f"  ({when})"
     except Exception:
         return p.name
 

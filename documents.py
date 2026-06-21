@@ -73,7 +73,8 @@ def generate_document(session_path: str, cfg=None) -> tuple[str, str]:
         md = re.sub(r"^```[a-z]*\n?|\n?```$", "", md).strip()
 
     stamp = Path(session_path).stem.replace("session_", "")
-    path = LIBRARY / f"{_slug(s.get('prompt', ''))}_{stamp}.md"
+    title = (final.get("title") or "").strip() or s.get("prompt", "")
+    path = LIBRARY / f"{_slug(title)}_{stamp}.md"
     path.write_text(md, encoding="utf-8")
     return str(path), md
 

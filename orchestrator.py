@@ -413,7 +413,8 @@ def phase_synthesize(chair, mp: MemoryPalace, best: dict | None, defaults: dict)
         "If the space is saturated, the odds are slim, or it's a weak idea, say so -- call=pivot or "
         "drop -- and point to the better move. Do NOT default to 'pursue' to please the user. "
         "ONLY JSON: "
-        '{"verdict": {"call": "pursue|pursue_with_changes|pivot|drop", "odds": "<blunt honest read of the chances>", "why": "<the deciding reason>"}, '
+        '{"title": "<3-7 word label capturing the CORE IDEA/answer, not the user\'s opening words>", '
+        '"verdict": {"call": "pursue|pursue_with_changes|pivot|drop", "odds": "<blunt honest read of the chances>", "why": "<the deciding reason>"}, '
         '"direct_answer": "<the answer, up front, in the right shape>", '
         '"key_points": ["<supporting point>", ...], '
         '"competitors": [{"name": "<real product/tool>", "what_they_do": "", "gap": "<what they miss>"}], '
@@ -439,7 +440,7 @@ def phase_synthesize(chair, mp: MemoryPalace, best: dict | None, defaults: dict)
         payload["instruction"] = ("Resolve every objection with a concrete fix, then output the "
                                   "improved answer. Keep what works; keep leading with direct_answer.")
     data, raw = ask_json(chair, system, json.dumps(payload, indent=2)[:14000], defaults)
-    return data or {"verdict": {}, "direct_answer": raw[:800], "key_points": [], "competitors": [],
+    return data or {"title": "", "verdict": {}, "direct_answer": raw[:800], "key_points": [], "competitors": [],
                     "differentiators": [], "fixes": [], "builds_on": [],
                     "dissent": [], "confidence": 0.0, "rationale": "(unparsed)"}
 
@@ -586,6 +587,7 @@ def run_debate(idea: str, seats: list, cfg, session_path: str | None = None) -> 
     mp.final = {
         "mode": _intent(mp).get("mode"),
         "question": _intent(mp).get("restate", mp.prompt),
+        "title": _as_text(bp.get("title", "")).strip(),
         "verdict": bp.get("verdict", {}) if isinstance(bp.get("verdict"), dict) else {},
         "direct_answer": _as_text(bp.get("direct_answer", "")),
         "ranked_plan": body,            # back-compat key; holds the mode-shaped body
