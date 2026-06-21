@@ -7,3 +7,5 @@ __pycache__/
 .uv/
 cloudflared.exe
 .gradio/
+sessions/_live.json
+sessions/_live.tmp

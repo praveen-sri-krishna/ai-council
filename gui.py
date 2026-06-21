@@ -10,7 +10,7 @@ consensus meter + seat cards that light up as each model speaks.
 """
 import datetime
 import html
-import queue
+import json
 import threading
 from pathlib import Path
 
@@ -254,84 +254,102 @@ def render_results(final: dict) -> tuple[str, str, str]:
     return plan_html, ev_html, lb_html
 
 
-# ---------- run handler (streaming) ----------
+# ---------- background runner (decoupled from the connection) ----------
+# The debate runs in a server-side thread that writes progress to a live file.
+# Viewing is a separate, short poll -> robust to mobile app-switching / tunnel drops.
+LIVE = SESSIONS / "_live.json"
 
-def run_debate_stream(idea: str, privacy: str, selected: list[str]):
+
+def _write_live(state: dict) -> None:
+    tmp = SESSIONS / "_live.tmp"
+    tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(LIVE)
+
+
+def _read_live() -> dict:
+    try:
+        return json.loads(LIVE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def start_debate(idea: str, privacy: str, selected: list[str]):
+    """Fire-and-forget: start the debate server-side and return immediately. It runs
+    independently of this connection, so switching apps / losing signal is fine."""
     cfg = load_config()
     cfg.privacy_mode = privacy
     avail = {s.id: s for s in available_seats(cfg)}
     seats = [avail[i] for i in (selected or []) if i in avail]
-    # Don't dead-end: if the picked seats resolve to <2 but the env has enough,
-    # just run with all available seats.
     if len(seats) < 2 and len(avail) >= 2:
         seats = list(avail.values())
-    blank = render_results({})
 
     if not idea.strip():
-        yield (render_trace([{"type": "error", "msg": "Enter an idea or problem to deliberate."}]),
-               render_meter(None, cfg.consensus_threshold, []), *blank)
-        return
+        return (render_trace([{"type": "error", "msg": "Enter an idea or problem to deliberate."}]),
+                render_meter(None, cfg.consensus_threshold, []), *render_results({}))
     if len(seats) < 2:
         why = ("No local seats available — start Ollama with the models in config.yaml."
                if privacy == "local_only" else
                "No seats available — add API keys to .env (open mode) or start Ollama.")
-        yield (render_trace([{"type": "error", "msg": why}]),
-               render_meter(None, cfg.consensus_threshold, []), *blank)
-        return
+        return (render_trace([{"type": "error", "msg": why}]),
+                render_meter(None, cfg.consensus_threshold, []), *render_results({}))
 
-    q: queue.Queue = queue.Queue()
-    orchestrator.set_emit(lambda e: q.put(e))
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = str(SESSIONS / f"session_{stamp}.json")
+    state = {"status": "running", "idea": idea, "events": [], "rounds": [],
+             "best": None, "final": {}, "path": path}
+    _write_live(state)
 
     def worker():
+        def emit(ev: dict):
+            if ev.get("type") == "round":
+                state["rounds"].append({"n": ev["n"], "best": ev["best"]})
+                state["best"] = ev["best"]
+            elif ev.get("type") == "final":
+                state["final"] = ev["final"]
+            state["events"].append(ev)
+            try:
+                _write_live(state)
+            except Exception:
+                pass
+        orchestrator.set_emit(emit)
         try:
             orchestrator.run_debate(idea, seats, cfg, session_path=path)
-        except Exception as ex:  # never hang the UI
-            q.put({"type": "error", "msg": f"{type(ex).__name__}: {ex}"})
-        finally:
-            q.put({"type": "_done"})
+            state["status"] = "done"
+        except Exception as ex:
+            state["events"].append({"type": "error", "msg": f"{type(ex).__name__}: {ex}"})
+            state["status"] = "error"
+        _write_live(state)
 
     threading.Thread(target=worker, daemon=True).start()
-
-    events: list[dict] = []
-    rounds: list[dict] = []
-    best = None
-    final: dict = {}
-    while True:
-        e = q.get()
-        if e.get("type") == "_done":
-            break
-        if e["type"] == "round":
-            rounds.append(e)
-            best = e["best"]
-        if e["type"] == "final":
-            final = e["final"]
-        events.append(e)
-        yield (render_trace(events), render_meter(best, cfg.consensus_threshold, rounds),
-               *render_results(final))
-    yield (render_trace(events), render_meter(best, cfg.consensus_threshold, rounds),
-           *render_results(final))
+    intro = [{"type": "phase", "name": "COUNCIL CONVENED — running in the background (~2-4 min)"},
+             {"type": "memory", "msg": "Switch apps freely. The live view auto-updates; or tap "
+              "'Refresh' anytime to see progress / the final answer."}]
+    return (render_trace(intro), render_meter(None, cfg.consensus_threshold, []), *render_results({}))
 
 
-def load_latest_result():
-    """Recover the most recent finished debate. The debate runs in a daemon thread
-    that completes + saves even if the (tunnel/mobile) stream connection drops, so
-    this button retrieves the result after any disconnect."""
+def refresh_view():
+    """Show current progress or the final result from the live file (or, if none,
+    the latest saved session). A short request -> works fine on mobile/tunnel."""
     cfg = load_config()
-    sess = list_sessions()
-    if not sess:
-        return (render_trace([{"type": "error", "msg": "No finished debates yet. If one is "
-                               "running, give it ~3 min, then load."}]),
-                render_meter(None, cfg.consensus_threshold, []), *render_results({}))
-    s = load_session(sess[0])
-    final = s.get("final", {})
-    rounds = [{"n": i + 1, "best": r["adjusted"]} for i, r in enumerate(s.get("synthesis", []))]
-    best = rounds[-1]["best"] if rounds else final.get("confidence")
-    ev = [{"type": "phase", "name": "LOADED LATEST RESULT"},
-          {"type": "memory", "msg": s.get("prompt", "")[:140]}]
-    return (render_trace(ev), render_meter(best, cfg.consensus_threshold, rounds),
-            *render_results(final))
+    st = _read_live()
+    if not st:
+        sess = list_sessions()
+        if not sess:
+            return (render_trace([{"type": "error", "msg": "No debates yet — enter an idea and "
+                                   "tap 'Convene the council'."}]),
+                    render_meter(None, cfg.consensus_threshold, []), *render_results({}))
+        s = load_session(sess[0])
+        final = s.get("final", {})
+        rounds = [{"n": i + 1, "best": r["adjusted"]} for i, r in enumerate(s.get("synthesis", []))]
+        best = rounds[-1]["best"] if rounds else final.get("confidence")
+        return (render_trace([{"type": "phase", "name": "LATEST SAVED RESULT"}]),
+                render_meter(best, cfg.consensus_threshold, rounds), *render_results(final))
+
+    status = st.get("status", "running")
+    label = {"running": "RUNNING…", "done": "DONE", "error": "ERROR"}.get(status, status.upper())
+    events = list(st.get("events", [])) + [{"type": "phase", "name": f"STATUS: {label}"}]
+    return (render_trace(events), render_meter(st.get("best"), cfg.consensus_threshold,
+            st.get("rounds", [])), *render_results(st.get("final", {})))
 
 
 # ---------- leader chat ----------
@@ -392,10 +410,10 @@ def build() -> gr.Blocks:
                                        label="Privacy mode")
                     seats = gr.CheckboxGroup(seat_ids, value=default_sel, label="Seats")
                     run = gr.Button("Convene the council", variant="primary")
-                    load = gr.Button("Load latest result")
-                    gr.HTML("<p class='note'>A debate takes ~2-4 min. It finishes on the "
-                            "server even if your connection drops &mdash; tap <b>Load latest "
-                            "result</b> to fetch it.</p>")
+                    load = gr.Button("↻ Refresh / Load result", variant="secondary")
+                    gr.HTML("<p class='note'>A debate runs on the server (~2-4 min) and keeps "
+                            "going even if you switch apps or lose signal. The view auto-updates; "
+                            "or tap <b>Refresh</b> anytime to see progress / the final answer.</p>")
                     meter = gr.HTML(render_meter(None, cfg.consensus_threshold, []))
                 with gr.Column(scale=6):
                     gr.HTML("<p class='sr-label'>Live deliberation</p>")
@@ -408,8 +426,10 @@ def build() -> gr.Blocks:
                 with gr.Column():
                     leaderboard = gr.HTML(render_results({})[2])
             outs = [trace, meter, plan, evidence, leaderboard]
-            run.click(run_debate_stream, [idea, privacy, seats], outs)
-            load.click(load_latest_result, None, outs)
+            run.click(start_debate, [idea, privacy, seats], outs)
+            load.click(refresh_view, None, outs)
+            # Auto-update the view with short polls (robust over tunnel/mobile, no held stream).
+            gr.Timer(5.0).tick(refresh_view, None, outs)
 
         with gr.Tab("Leader chat"):
             gr.HTML("<p class='sr-label'>Brief the leader 1:1 — they answer, "
