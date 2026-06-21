@@ -17,7 +17,7 @@ from pathlib import Path
 import gradio as gr
 
 import orchestrator
-from documents import generate_document, list_documents
+from documents import LIBRARY, generate_document, list_documents
 from leader import leader_chat, leader_id, load_session
 from seats import available_seats, load_config
 
@@ -513,7 +513,7 @@ def build() -> gr.Blocks:
             with gr.Row():
                 doc_sel = gr.Dropdown(list_documents(), label="Document", scale=4)
                 doc_refresh = gr.Button("↻", scale=1)
-            doc_file = gr.File(label="Download", interactive=False)
+            doc_file = gr.DownloadButton("⬇ Download document (.md)", variant="secondary")
             doc_view = gr.Markdown("_Generate a document from the Leader chat tab, "
                                    "then pick it here._")
             doc_refresh.click(lambda: gr.update(choices=list_documents()), None, doc_sel)
@@ -529,5 +529,7 @@ def build() -> gr.Blocks:
 if __name__ == "__main__":
     # share=True needs Gradio's tunnel binary (may be network-blocked). The public
     # showcase lives on GitHub Pages (docs/, built by build_site.py); this serves locally.
+    # allowed_paths: let Gradio serve the generated docs for download (else clicks do nothing).
     build().launch(server_name="127.0.0.1", server_port=7860, inbrowser=True,
-                   css=CSS, theme=gr.themes.Base())
+                   css=CSS, theme=gr.themes.Base(),
+                   allowed_paths=[str(LIBRARY.resolve()), str(SESSIONS.resolve())])
