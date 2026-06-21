@@ -78,15 +78,36 @@ seats:
     role: heavyweight
     personality: "Large-model depth my GPU can't run locally."
 
+  # CHAIR = strongest free reasoner (won the chair bake-off). Does the core consult
+  # (synthesis) — runs few times, so quality matters more than speed here.
+  - id: gemini-pro
+    provider: gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    model: gemini-2.5-pro
+    key_env: GEMINI_API_KEY
+    role: chair
+    personality: "Lead synthesizer. Rigorous, decisive, resolves disagreement with evidence."
+
+  # RESEARCHER = fast model for the high-frequency light work (classify, search
+  # queries, fact-check verdicts). Speed matters; gemini-flash has 1M context.
   - id: gemini-chair
     provider: gemini
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
     model: gemini-2.5-flash
     key_env: GEMINI_API_KEY
-    role: chair
-    personality: "Synthesizer + researcher. 1M context for ingesting evidence."
-    # No reasoning_effort cap: let it think fully. We give a large max_tokens instead
-    # so thinking + the full JSON answer both fit (thinking counts toward output budget).
+    role: researcher
+    personality: "Researcher. 1M context for ingesting evidence; fast turnarounds."
+
+  # Optional deep reasoner (DeepSeek V4 Pro topped 2026 open-weight benchmarks; the
+  # lone 'pivot' verdict in the bake-off = most willing to push back). Auto-mode can
+  # escalate to this as chair on hard strategy questions.
+  - id: nvidia-deepseek
+    provider: nvidia
+    base_url: https://integrate.api.nvidia.com/v1
+    model: deepseek-ai/deepseek-v4-pro
+    key_env: NVIDIA_API_KEY
+    role: reasoner
+    personality: "Deep, skeptical reasoner. Stress-tests assumptions hard."
 
   - id: groq-fast
     provider: groq

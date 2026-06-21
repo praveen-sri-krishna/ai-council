@@ -68,6 +68,8 @@ def _console(e: dict) -> None:
         print(f"  [revise] {e['n']} seats revised")
     elif t == "lateral":
         print(f"  [lateral] injected {e['key']}: {e['proposal'][:70]}")
+    elif t == "escalation":
+        print(f"  [escalation] brought in {e['seat']}: {e['proposal'][:60]}")
     elif t == "round":
         print(f"  round {e['n']}: this={e['this']:.3f} best(reported)={e['best']:.3f} "
               f"(threshold {e['threshold']})")
@@ -125,7 +127,8 @@ def pick_chair(seats: list):
 
 
 def pick_researcher(seats: list):
-    for role in ("chair", "researcher", "generalist"):
+    # Prefer a fast researcher for light/frequent work; keep the strong chair for synthesis.
+    for role in ("researcher", "generalist", "fast-backup", "fast-heavyweight", "chair"):
         for s in seats:
             if s.role == role:
                 return s
@@ -500,6 +503,28 @@ def phase_lateral(idea: str, dissenter, mp: MemoryPalace, defaults: dict) -> Non
               "builds_on": data["builds_on"]})
 
 
+def phase_escalate(idea: str, expert, mp: MemoryPalace, defaults: dict) -> None:
+    """Reinforcement: when the council is unsure, bring in a stronger reasoner for a
+    deeper take. Its proposal enters the pool so the next synthesis incorporates it."""
+    system = (
+        f"You are a senior expert brought in because the panel is stuck below the bar. "
+        f"{expert.personality} Cut to the real crux: the decisive consideration, the sharpest "
+        "reframe, or the strongest objection the others underweighted. Be concrete and decisive. "
+        'ONLY JSON: {"proposal": "<your deeper take/answer>", "reasoning": "<the crux>", '
+        '"builds_on": ["existing tool if any"]}'
+    )
+    user = (f"Problem: {idea}\n\nPrior art:\n{_prior_art_brief(mp)}\n\n"
+            f"Current best answer:\n{json.dumps((mp.synthesis[-1]['proposal'] if mp.synthesis else {}), indent=2)[:3000]}")
+    data, raw = ask_json(expert, system, user, defaults)
+    if data and data.get("proposal"):
+        data["proposal"] = _as_text(data["proposal"])
+        data["builds_on"] = _as_list(data.get("builds_on", []))
+        key = f"escalation-{sum(1 for k in mp.proposals if k.startswith('escalation'))+1}"
+        mp.add_proposal(key, "escalation", data)
+        mp.log(key, f"escalation({expert.id}): {data['proposal'][:140]}")
+        emit({"type": "escalation", "seat": expert.id, "proposal": data["proposal"]})
+
+
 def consensus_penalty(scores: list[float]) -> float:
     low = sum(1 for x in scores if x <= 0.55)
     high = sum(1 for x in scores if x >= 0.75)
@@ -525,9 +550,12 @@ def compute_leaderboard(mp: MemoryPalace) -> dict:
 
 # --- Driver ---------------------------------------------------------------
 
-def run_debate(idea: str, seats: list, cfg, session_path: str | None = None) -> MemoryPalace:
+def run_debate(idea: str, seats: list, cfg, session_path: str | None = None,
+               escalation: list | None = None) -> MemoryPalace:
     d = cfg.defaults
     mp = MemoryPalace(prompt=idea)
+    seats = list(seats)
+    pool = list(escalation or [])   # stronger/extra models pulled in when the panel is unsure
     chair = pick_chair(seats)
     researcher = pick_researcher(seats)
     dissenter = next((s for s in seats if s.role in ("dissenter", "red-teamer")), seats[-1])
@@ -556,9 +584,19 @@ def run_debate(idea: str, seats: list, cfg, session_path: str | None = None) -> 
     best = None
     stalled = False
     for it in range(cfg.max_iterations):
-        if stalled and best and best["adjusted"] < cfg.consensus_threshold:
-            emit({"type": "phase", "name": "  (stalled -> out-of-the-box pass)"})
-            phase_lateral(idea, dissenter, mp, d)
+        # "Unsure" = confidence still well below threshold (low) OR a stalled round.
+        # Either way, bring in more reasoning power (escalate) or a fresh angle (lateral).
+        low_conf = best is not None and best["adjusted"] < cfg.consensus_threshold - 0.10
+        if best is not None and best["adjusted"] < cfg.consensus_threshold and (stalled or low_conf):
+            if pool:
+                expert = pool.pop(0)
+                emit({"type": "phase", "name": f"  (unsure {best['adjusted']:.2f} -> escalating: + {expert.id})"})
+                phase_escalate(idea, expert, mp, d)
+                if expert.id not in {s.id for s in seats}:
+                    seats.append(expert)
+            else:
+                emit({"type": "phase", "name": "  (stalled -> out-of-the-box pass)"})
+                phase_lateral(idea, dissenter, mp, d)
             stalled = False
         synth = synth_with_failover(chair, mp, best, d, seats)
         votes = phase_vote(synth, seats, d)

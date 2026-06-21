@@ -19,6 +19,7 @@ import gradio as gr
 import orchestrator
 from documents import LIBRARY, generate_document, list_documents
 from leader import leader_chat, leader_id, load_session
+from router import auto_roster
 from seats import available_seats, load_config
 
 SESSIONS = Path("sessions")
@@ -170,6 +171,10 @@ def render_trace(events: list[dict]) -> str:
         elif t == "lateral":
             rows.append(f"<div class='ev lateral'><div class='who'>out-of-the-box</div>"
                         f"<div class='txt'>{_esc(e['proposal'][:240])}</div></div>")
+        elif t == "escalation":
+            rows.append(f"<div class='ev lateral'><div class='who'>escalation &middot; "
+                        f"{_esc(e['seat'])}</div><div class='txt'>council unsure — brought in a "
+                        f"stronger reasoner: {_esc(e['proposal'][:200])}</div></div>")
         elif t == "round":
             arrow = "reached threshold" if e["best"] >= e["threshold"] else f"best {e['best']:.3f}"
             rows.append(f"<div class='ev round'><div class='who'>round {e['n']}</div>"
@@ -274,15 +279,23 @@ def _read_live() -> dict:
         return {}
 
 
-def start_debate(idea: str, privacy: str, selected: list[str]):
+def start_debate(idea: str, privacy: str, selected: list[str], auto: bool = True):
     """Fire-and-forget: start the debate server-side and return immediately. It runs
     independently of this connection, so switching apps / losing signal is fine."""
     cfg = load_config()
     cfg.privacy_mode = privacy
     avail = {s.id: s for s in available_seats(cfg)}
-    seats = [avail[i] for i in (selected or []) if i in avail]
-    if len(seats) < 2 and len(avail) >= 2:
-        seats = list(avail.values())
+
+    route_note = ""
+    pool: list = []
+    if auto and idea.strip():
+        seats, pool, mode = auto_roster(idea, cfg)
+        extra = f" · escalate-if-unsure: {', '.join(s.id for s in pool[:3])}" if pool else ""
+        route_note = f"auto-routed for a '{mode}' task → {', '.join(s.id for s in seats)}{extra}"
+    else:
+        seats = [avail[i] for i in (selected or []) if i in avail]
+        if len(seats) < 2 and len(avail) >= 2:
+            seats = list(avail.values())
 
     if not idea.strip():
         return (render_trace([{"type": "error", "msg": "Enter an idea or problem to deliberate."}]),
@@ -314,7 +327,7 @@ def start_debate(idea: str, privacy: str, selected: list[str]):
                 pass
         orchestrator.set_emit(emit)
         try:
-            orchestrator.run_debate(idea, seats, cfg, session_path=path)
+            orchestrator.run_debate(idea, seats, cfg, session_path=path, escalation=pool)
             state["status"] = "done"
         except Exception as ex:
             state["events"].append({"type": "error", "msg": f"{type(ex).__name__}: {ex}"})
@@ -322,9 +335,11 @@ def start_debate(idea: str, privacy: str, selected: list[str]):
         _write_live(state)
 
     threading.Thread(target=worker, daemon=True).start()
-    intro = [{"type": "phase", "name": "COUNCIL CONVENED — running in the background (~2-4 min)"},
-             {"type": "memory", "msg": "Switch apps freely. The live view auto-updates; or tap "
-              "'Refresh' anytime to see progress / the final answer."}]
+    intro = [{"type": "phase", "name": "COUNCIL CONVENED — running in the background (~2-4 min)"}]
+    if route_note:
+        intro.append({"type": "memory", "msg": route_note})
+    intro.append({"type": "memory", "msg": "Switch apps freely. The live view auto-updates; or "
+                  "tap 'Refresh' anytime to see progress / the final answer."})
     return (render_trace(intro), render_meter(None, cfg.consensus_threshold, []), *render_results({}))
 
 
@@ -450,7 +465,7 @@ def on_leader_msg(path: str, msg: str, history: list):
 def build() -> gr.Blocks:
     cfg = load_config()
     seat_ids = [s.id for s in cfg.seats]
-    default_sel = [i for i in ("cerebras-fast", "groq-fast", "gemini-chair") if i in seat_ids]
+    default_sel = [i for i in ("cerebras-fast", "groq-fast", "gemini-pro") if i in seat_ids]
 
     with gr.Blocks(title="AI Council — Situation Room") as app:
         gr.HTML("<div id='sr-head'><h1>AI <span class='ac'>Council</span> "
@@ -465,7 +480,10 @@ def build() -> gr.Blocks:
                                       lines=4, show_label=False)
                     privacy = gr.Radio(["open", "local_only"], value=cfg.privacy_mode,
                                        label="Privacy mode")
-                    seats = gr.CheckboxGroup(seat_ids, value=default_sel, label="Seats")
+                    auto = gr.Checkbox(value=True, label="⚡ Auto-route models by task "
+                                       "(strong reasoner for synthesis, fast models for the rest)")
+                    seats = gr.CheckboxGroup(seat_ids, value=default_sel,
+                                             label="Seats (used only when Auto-route is off)")
                     run = gr.Button("Convene the council", variant="primary")
                     load = gr.Button("↻ Refresh / Load result", variant="secondary")
                     gr.HTML("<p class='note'>A debate runs on the server (~2-4 min) and keeps "
@@ -483,7 +501,7 @@ def build() -> gr.Blocks:
                 with gr.Column():
                     leaderboard = gr.HTML(render_results({})[2])
             outs = [trace, meter, plan, evidence, leaderboard]
-            run.click(start_debate, [idea, privacy, seats], outs)
+            run.click(start_debate, [idea, privacy, seats, auto], outs)
             load.click(refresh_view, None, outs)
             # Auto-update the view with short polls (robust over tunnel/mobile, no held stream).
             gr.Timer(5.0).tick(refresh_view, None, outs)
