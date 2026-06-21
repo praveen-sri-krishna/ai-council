@@ -117,11 +117,13 @@ seats:
     role: fast-backup
     personality: "Snappy fallback fast lane."
 
+  # Kimi for BUILD steps, on NVIDIA's FREE tier (not paid OpenRouter). Used for
+  # turning an agreed plan into concrete build steps — not for reasoning/escalation.
   - id: kimi-builder
-    provider: openrouter
-    base_url: https://openrouter.ai/api/v1
-    model: moonshotai/kimi-k2.7-code
-    key_env: OPENROUTER_API_KEY
+    provider: nvidia
+    base_url: https://integrate.api.nvidia.com/v1
+    model: moonshotai/kimi-k2.6
+    key_env: NVIDIA_API_KEY
     role: builder
     personality: "Turns the agreed plan into concrete build steps. Used sparingly."
 
