@@ -65,6 +65,7 @@ class Config:
     max_iterations: int
     history_compress_after: int
     defaults: dict
+    max_escalations: int = 1
     search_provider: str = "duckduckgo"
     seats: list[Seat] = field(default_factory=list)
     failover: dict = field(default_factory=dict)
@@ -81,6 +82,7 @@ def load_config(path: str = "config.yaml") -> Config:
         max_iterations=raw.get("max_iterations", 4),
         history_compress_after=raw.get("history_compress_after", 15),
         defaults=defaults,
+        max_escalations=raw.get("max_escalations", 1),
         search_provider=raw.get("search_provider", "duckduckgo"),
         seats=seats,
         failover=raw.get("failover", {}),

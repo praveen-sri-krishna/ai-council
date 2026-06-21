@@ -111,8 +111,11 @@ def github_prior_art(query: str, max_results: int = 5, sort: str = "stars") -> l
 
 
 def gather_evidence(claim: str, max_results: int = 4, provider: str = "duckduckgo") -> dict:
-    """Adversarial retrieval for one claim: a supporting pass and a counter pass."""
-    supporting = search_web(claim, max_results, provider)
-    counter = search_web(f"{claim} criticism OR limitations OR debunked OR false",
-                         max_results, provider)
-    return {"claim": claim, "supporting": supporting, "counter": counter}
+    """Adversarial retrieval for one claim: a supporting pass and a counter pass,
+    run concurrently (independent web searches)."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        sup = ex.submit(search_web, claim, max_results, provider)
+        cnt = ex.submit(search_web, f"{claim} criticism OR limitations OR debunked OR false",
+                        max_results, provider)
+        return {"claim": claim, "supporting": sup.result(), "counter": cnt.result()}

@@ -22,9 +22,9 @@ def quick_mode(idea: str, seat, defaults: dict) -> str:
         return "analysis"
 
 
-# Strongest REASONERS to pull in (in order) when the council is unsure. All free-tier
-# lanes (NVIDIA/Gemini/local). Kimi is excluded here — it's a builder, not a reasoner.
-_ESCALATION_PREF = ["nvidia-deepseek", "cerebras-glm", "gemini-pro", "nvidia-heavy",
+# Strong but SLOW brains, pulled in (in order) only when the fast council is unsure.
+# The escalated brain then leads synthesis. All free-tier (Gemini/NVIDIA/local).
+_ESCALATION_PREF = ["gemini-pro", "nvidia-deepseek", "nvidia-heavy",
                     "deepseek-critic", "qwen-generalist"]
 
 
@@ -41,17 +41,14 @@ def auto_roster(idea: str, cfg) -> tuple[list, list, str]:
     def pick(ids: list) -> list:
         return [avail[i] for i in ids if i in avail]
 
-    # Default base = 3 (tiered: fast workers + a strong chair). Stronger models are
-    # held in the escalation pool and pulled in only when the council is unsure.
-    if mode == "factual":            # quick: 3 fast models, no heavy chair needed
-        base = pick(["cerebras-fast", "groq-fast", "gemini-chair"])
-    elif mode == "brainstorm":       # divergence: a dissenter for spread + strong chair
-        base = pick(["cerebras-fast", "gemma-dissenter", "gemini-pro"])
-    else:                            # decision/build/comparison/analysis
-        base = pick(["cerebras-fast", "groq-fast", "gemini-pro"])
+    # Default base = FAST free models only (cerebras gpt-oss-120b ~2s, groq ~5s,
+    # cerebras GLM-4.7) so the common case is quick. Slow strong brains (gemini-pro,
+    # deepseek) sit in the escalation pool and are pulled in only when unsure.
+    if mode == "factual":            # quick: 2 fast models
+        base = pick(["cerebras-fast", "groq-fast"])
+    else:                            # brainstorm/decision/build/comparison/analysis
+        base = pick(["cerebras-fast", "groq-fast", "cerebras-glm"])
 
-    if mode != "factual" and "gemini-pro" in avail and avail["gemini-pro"] not in base:
-        base.append(avail["gemini-pro"])
     seen, uniq = set(), []
     for s in base:                   # dedupe, keep order
         if s.id not in seen:

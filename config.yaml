@@ -15,7 +15,8 @@ council_charter: |
 privacy_mode: open          # local_only = local seats + no search egress | open = hosted seats allowed
 search_provider: duckduckgo # duckduckgo (keyless) | searxng (Docker, swap in later)
 consensus_threshold: 0.95   # synthesis vote average needed to finish
-max_iterations: 4           # hard cap on synthesize->vote loops
+max_iterations: 3           # hard cap on synthesize->vote loops (early-stops sooner)
+max_escalations: 1          # at most N stronger brains pulled in when unsure (speed)
 history_compress_after: 15  # compress Memory Palace discussion log past this many entries
 
 defaults:

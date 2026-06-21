@@ -7,6 +7,7 @@ decreases across rounds, and an out-of-the-box (lateral) pass when it stalls.
 """
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from statistics import mean
 
 from memory import MemoryPalace, retrieve_cases, write_case
@@ -20,7 +21,24 @@ try:
 except Exception:
     pass
 
-MAX_CLAIMS = 5  # cap verified claims per debate to bound search quota
+MAX_CLAIMS = 3  # cap verified claims per debate (fewer web searches = faster)
+
+
+def _pmap(items: list, fn, parallel: bool = True):
+    """Map fn over items. Concurrent for hosted (I/O-bound API calls) -> big speedup;
+    sequential when items include local seats (one model holds the GPU at a time).
+    Preserves order."""
+    items = list(items)
+    if not items:
+        return []
+    if not parallel or len(items) == 1:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(max_workers=min(8, len(items))) as ex:
+        return list(ex.map(fn, items))
+
+
+def _hosted_only(seats: list) -> bool:
+    return not any(getattr(s, "local", False) for s in seats)
 
 # --- Event stream: phases emit structured events. A GUI registers a hook via
 # set_emit(); the CLI default pretty-prints. One debate per process. ---
@@ -188,20 +206,24 @@ def phase_research(idea: str, researcher, mp: MemoryPalace, cfg) -> None:
     def kw_fallback() -> str:
         return " ".join(_keywords(idea)[:4])
 
-    # Forced: proven prior art (by stars) + latest/trending (recently active) on GitHub.
-    prior_art = github_prior_art(data.get("github_query") or kw_fallback(), max_results=6)
-    if not prior_art:
-        prior_art = github_prior_art(kw_fallback(), max_results=6)
-    latest_repos = github_prior_art(data.get("latest_query") or (kw_fallback() + " 2026"),
-                                    max_results=6, sort="updated")
-    # Forced: web search for competitors + the latest/viral tools in the field.
-    competitors = search_web(data.get("competitor_query") or f"{idea} competitors alternatives 2026",
-                             max_results=5, provider=provider)
-    latest_web = search_web(data.get("latest_query") or f"{idea} new tools 2026 trending",
-                            max_results=5, provider=provider)
-    context = []
-    for q in (data.get("context_queries") or [])[:2]:
-        context.append({"query": q, "results": search_web(q, max_results=4, provider=provider)})
+    # All searches are independent + I/O-bound -> run them concurrently (big speedup).
+    cq = (data.get("context_queries") or [])[:2]
+    tasks = {
+        "prior_art": lambda: github_prior_art(data.get("github_query") or kw_fallback(), 6)
+                             or github_prior_art(kw_fallback(), 6),
+        "latest_repos": lambda: github_prior_art(data.get("latest_query") or (kw_fallback() + " 2026"),
+                                                 6, sort="updated"),
+        "competitors": lambda: search_web(data.get("competitor_query") or f"{idea} competitors alternatives 2026",
+                                          max_results=5, provider=provider),
+        "latest_web": lambda: search_web(data.get("latest_query") or f"{idea} new tools 2026 trending",
+                                         max_results=5, provider=provider),
+    }
+    keys = list(tasks)
+    results = dict(zip(keys, _pmap(keys, lambda k: tasks[k]())))
+    prior_art, latest_repos = results["prior_art"], results["latest_repos"]
+    competitors, latest_web = results["competitors"], results["latest_web"]
+    context = [{"query": q, "results": r} for q, r in
+               zip(cq, _pmap(cq, lambda q: search_web(q, max_results=4, provider=provider)))] if cq else []
 
     mp.research.update({"queries": data, "prior_art": prior_art, "latest_repos": latest_repos,
                         "competitors_raw": competitors, "latest_web": latest_web, "context": context})
@@ -252,7 +274,8 @@ def phase_propose(idea: str, seats: list, mp: MemoryPalace, defaults: dict,
         extra += ("\n\nExisting tools/prior art (build ON these where sensible, "
                   "don't reinvent):\n" + _prior_art_brief(mp))
     intent = _intent(mp)
-    for s in seats:
+
+    def work(s):
         system = (
             f"You are a {s.role} on an expert council. {s.personality} "
             f"ANSWER THE ACTUAL QUESTION (\"{intent.get('restate', idea)}\") in this shape: "
@@ -269,6 +292,9 @@ def phase_propose(idea: str, seats: list, mp: MemoryPalace, defaults: dict,
         data["proposal"] = _as_text(data.get("proposal", ""))
         data["builds_on"] = _as_list(data.get("builds_on", []))
         data["claims_to_verify"] = _as_list(data.get("claims_to_verify", []))
+        return s, data
+
+    for s, data in _pmap(seats, work, parallel=_hosted_only(seats)):
         mp.add_proposal(s.id, s.role, data)
         mp.log(s.id, f"proposed: {data['proposal'][:160]}")
         emit({"type": "propose", "seat": s.id, "role": s.role,
@@ -279,10 +305,11 @@ def phase_propose(idea: str, seats: list, mp: MemoryPalace, defaults: dict,
 
 def phase_critique(seats: list, mp: MemoryPalace, defaults: dict) -> None:
     board = {sid: p["proposal"] for sid, p in mp.proposals.items()}
-    for s in seats:
+
+    def work(s):
         others = {sid: txt for sid, txt in board.items() if sid != s.id}
         if not others:
-            continue
+            return s, None, ""
         system = (
             f"You are a {s.role}. {s.personality} Critique each peer proposal honestly. "
             "For EACH id return: score (0.0-1.0), strengths, weaknesses, "
@@ -291,6 +318,11 @@ def phase_critique(seats: list, mp: MemoryPalace, defaults: dict) -> None:
             '"hidden_assumptions": "", "failure_modes": ""}, ...}'
         )
         data, raw = ask_json(s, system, "Proposals:\n" + json.dumps(others, indent=2), defaults)
+        return s, data, raw
+
+    for s, data, raw in _pmap(seats, work, parallel=_hosted_only(seats)):
+        if data is None and not raw:
+            continue
         mp.add_critique(s.id, data or {"_raw": raw[:600]})
         emit({"type": "critique", "seat": s.id, "n": len(data) if data else 0})
 
@@ -309,8 +341,7 @@ def phase_webground(researcher, mp: MemoryPalace, cfg) -> None:
         emit({"type": "webground_summary", "counts": {}, "ratio": None})
         return
 
-    verdicts = []
-    for c in claims:
+    def verify(c):
         ev = gather_evidence(c, max_results=4, provider=provider)
         system = (
             "You are a fact-checker. Given supporting and counter evidence, judge the claim. "
@@ -324,8 +355,12 @@ def phase_webground(researcher, mp: MemoryPalace, cfg) -> None:
         data, _ = ask_json(researcher, system, user, cfg.defaults)
         data = data or {"verdict": "uncertain", "confidence": 0.0, "note": "(no parse)", "source": ""}
         data["claim"] = c
-        verdicts.append(data)
-        emit({"type": "webground", "verdict": data["verdict"], "claim": c,
+        return data
+
+    # Claims are independent + I/O-heavy (web search) -> verify concurrently.
+    verdicts = _pmap(claims, verify, parallel=True)
+    for data in verdicts:
+        emit({"type": "webground", "verdict": data["verdict"], "claim": data["claim"],
               "note": data.get("note", "")})
 
     n = len(verdicts)
@@ -468,17 +503,19 @@ def synth_with_failover(primary, mp: MemoryPalace, best: dict | None,
 
 
 def phase_vote(synthesis: dict, seats: list, defaults: dict) -> dict:
-    votes = {}
-    for s in seats:
+    plan_str = "Plan:\n" + json.dumps(synthesis, indent=2)
+
+    def work(s):
         system = (
             f"You are a {s.role}. {s.personality} Score the plan 0.0-1.0 on quality, evidence, "
             'and whether it resolves your concerns. ONLY JSON: {"score": 0.0, "reason": ""}'
         )
-        data, raw = ask_json(s, system, "Plan:\n" + json.dumps(synthesis, indent=2), defaults)
+        data, raw = ask_json(s, system, plan_str, defaults)
         score = float(data.get("score", 0.0)) if data else 0.0
-        votes[s.id] = {"score": max(0.0, min(1.0, score)),
-                       "reason": (data or {}).get("reason", raw[:200])}
-    return votes
+        return s.id, {"score": max(0.0, min(1.0, score)),
+                      "reason": (data or {}).get("reason", raw[:200])}
+
+    return {sid: v for sid, v in _pmap(seats, work, parallel=_hosted_only(seats))}
 
 
 # --- Out-of-the-box (lateral) pass ---------------------------------------
@@ -583,33 +620,45 @@ def run_debate(idea: str, seats: list, cfg, session_path: str | None = None,
     emit({"type": "phase", "name": "SYNTHESIZE -> VOTE (monotonic)"})
     best = None
     stalled = False
+    escalations = 0
+    lateral_done = False
+    max_esc = getattr(cfg, "max_escalations", 1)
     for it in range(cfg.max_iterations):
-        # "Unsure" = confidence still well below threshold (low) OR a stalled round.
-        # Either way, bring in more reasoning power (escalate) or a fresh angle (lateral).
+        # Unsure (low confidence or a stalled round) -> escalate ONCE to a stronger
+        # brain (which then leads synthesis), else stop. Keeps the common case fast.
         low_conf = best is not None and best["adjusted"] < cfg.consensus_threshold - 0.10
         if best is not None and best["adjusted"] < cfg.consensus_threshold and (stalled or low_conf):
-            if pool:
+            if pool and escalations < max_esc:
                 expert = pool.pop(0)
+                escalations += 1
                 emit({"type": "phase", "name": f"  (unsure {best['adjusted']:.2f} -> escalating: + {expert.id})"})
                 phase_escalate(idea, expert, mp, d)
                 if expert.id not in {s.id for s in seats}:
                     seats.append(expert)
-            else:
+                chair = expert   # the brain now leads synthesis (deeper final answer)
+                stalled = False
+            elif not pool and not lateral_done:
+                # No escalation pool (e.g. local_only) -> one out-of-the-box pass.
                 emit({"type": "phase", "name": "  (stalled -> out-of-the-box pass)"})
                 phase_lateral(idea, dissenter, mp, d)
-            stalled = False
+                lateral_done = True
+                stalled = False
+            elif stalled:
+                # No budget left and not improving -> stop early (don't grind).
+                break
         synth = synth_with_failover(chair, mp, best, d, seats)
         votes = phase_vote(synth, seats, d)
         scores = [v["score"] for v in votes.values()]
         avg = mean(scores) if scores else 0.0
         adjusted = max(0.0, avg - consensus_penalty(scores))
 
-        improved = best is None or adjusted > best["adjusted"]
-        if improved:
+        # Keep best on ANY gain (monotonic reporting), but a marginal gain (<0.02)
+        # counts as stalled -> triggers escalation/early-stop instead of grinding.
+        gained = best is None or adjusted > best["adjusted"]
+        meaningful = best is None or adjusted > best["adjusted"] + 0.02
+        if gained:
             best = {"proposal": synth, "votes": votes, "avg": avg, "adjusted": adjusted}
-            stalled = False
-        else:
-            stalled = True
+        stalled = not meaningful
         reported = best["adjusted"]   # never decreases
         mp.add_synthesis_round(synth, votes, avg, reported)
         emit({"type": "round", "n": it + 1, "this": adjusted, "best": reported,
