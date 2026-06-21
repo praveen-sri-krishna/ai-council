@@ -24,7 +24,7 @@ def quick_mode(idea: str, seat, defaults: dict) -> str:
 
 # Strongest REASONERS to pull in (in order) when the council is unsure. All free-tier
 # lanes (NVIDIA/Gemini/local). Kimi is excluded here — it's a builder, not a reasoner.
-_ESCALATION_PREF = ["nvidia-deepseek", "gemini-pro", "nvidia-heavy",
+_ESCALATION_PREF = ["nvidia-deepseek", "cerebras-glm", "gemini-pro", "nvidia-heavy",
                     "deepseek-critic", "qwen-generalist"]
 
 

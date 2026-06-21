@@ -109,6 +109,16 @@ seats:
     role: reasoner
     personality: "Deep, skeptical reasoner. Stress-tests assumptions hard."
 
+  # Another top-benchmarked free reasoner (GLM-4.7), fast on Cerebras's free tier.
+  # Used as an escalation brain for extra depth/diversity when the council is unsure.
+  - id: cerebras-glm
+    provider: cerebras
+    base_url: https://api.cerebras.ai/v1
+    model: zai-glm-4.7
+    key_env: CEREBRAS_API_KEY
+    role: reasoner
+    personality: "Sharp reasoner with strong technical depth; finds the real moat."
+
   - id: groq-fast
     provider: groq
     base_url: https://api.groq.com/openai/v1
